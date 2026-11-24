@@ -1505,6 +1505,11 @@ void CPU::execute(const DecodedInsn& insn) {
     case Mnemonic::INVLPG: case Mnemonic::INVPCID:
     case Mnemonic::WBINVD: case Mnemonic::CLFLUSH: case Mnemonic::CLFLUSHOPT:
         break;
+    case Mnemonic::CLZERO: {
+        uint64_t line = regs_.rax & ~63ULL;
+        for (int i = 0; i < 64; i += 8) mem_write_(line + i, 0, 8);
+        break;
+    }
 
     // ── Memory fences / prefetch ──────────────────────────────────────────────
     case Mnemonic::FENCE: case Mnemonic::MFENCE:

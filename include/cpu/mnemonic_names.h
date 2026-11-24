@@ -133,6 +133,7 @@ inline const char* mnemonic_name(int m) {
         "WBINVD",
         "CLFLUSH",
         "CLFLUSHOPT",
+        "CLZERO",
         "MOV_CR",
         "MOV_DR",
         "MOV_SR",

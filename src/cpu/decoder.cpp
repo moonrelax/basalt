@@ -600,6 +600,7 @@ DecodedInsn Decoder::decode_two_byte(Ctx& c) {
         case 0x01: {
             uint8_t modrm_b = c.base[c.pos];
             if (modrm_b == 0xD0) { c.read8(); insn.mnemonic=Mnemonic::XGETBV; break; }
+            if (modrm_b == 0xFC) { c.read8(); insn.mnemonic=Mnemonic::CLZERO; break; } // AMD: zero the 64-byte line at RAX
             if (modrm_b == 0xF8) { c.read8(); insn.mnemonic=Mnemonic::SWAPGS; break; }
             if (modrm_b == 0xF9) { c.read8(); insn.mnemonic=Mnemonic::RDTSCP; break; }
             auto m=modrm();

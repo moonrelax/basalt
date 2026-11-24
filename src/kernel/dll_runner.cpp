@@ -102,6 +102,7 @@ bool should_deny_gdk_guid(const std::string& provider, const std::string& iid) {
 }
 
 std::map<const DllRunner*, GdkComState> g_gdk_states;
+static int g_sync_log = 0;
 
 std::string format_guid(const memory::MemoryMap& mem, uint64_t va) {
     if (!va) return "{null}";
@@ -723,8 +724,23 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
             it->second.consume();
             return WAIT_OBJECT_0;
         }
-        std::fprintf(stderr, "    [sync] WaitForSingleObject handle=0x%llx (event unsignaled) timeout=%u\n",
-                     static_cast<unsigned long long>(handle), timeout_ms);
+        // timeout 0 is a poll; logging each one filled runs/ (hundreds of thousands of lines).
+        if (timeout_ms != 0 && g_sync_log < 28) {
+            ++g_sync_log;
+            std::fprintf(stderr, "    [sync] WaitForSingleObject handle=0x%llx (event unsignaled) timeout=%u\n",
+                         static_cast<unsigned long long>(handle), timeout_ms);
+        }
+        if (timeout_ms == 0) {
+            uint64_t ret_va = mem_.read64(cpu_.regs().rsp);
+            static int boot_polls = 0;
+            if (ret_va - 0x140000000ULL == 0x5441bec && boot_polls < 4) {
+                ++boot_polls;
+                std::fprintf(stderr, "    [sync] boot-poll h=0x%llx sig=%d sem=%lld\n",
+                             static_cast<unsigned long long>(handle),
+                             it->second.signaled ? 1 : 0,
+                             static_cast<long long>(it->second.sem_count));
+            }
+        }
         if (scheduler_mode_ && timeout_ms != 0) {
             wait_req_.active = true;
             wait_req_.wait_all = false;
@@ -882,6 +898,11 @@ DllRunner::Stop DllRunner::loop(uint64_t sentinel) {
         }
         if (!in_image(r.rip)) return Stop::WildJump;
         if (++insn_count_ > budget_) return Stop::Budget;
+        if ((insn_count_ & 0xFFFFFFULL) == 0) {
+            std::fprintf(stderr, "  [progress] insns=%llu rip=%s\n",
+                         static_cast<unsigned long long>(insn_count_), where(r.rip).c_str());
+            std::fflush(stderr);
+        }
         cpu_.step();
         if (cpu_.fault()) return Stop::Fault;
         if (cpu_.halted()) return Stop::Halt;
@@ -1309,7 +1330,33 @@ void DllRunner::handle_thunk(const Thunk& t) {
                              static_cast<unsigned long long>(obj), where(ret_addr).c_str());
             return ret(0);
         }
+        // CreateQueue(this, desc, riid, ppv). Called as vtbl+0x50 from exe+0x28c95c7.
+        // Returning S_OK without writing *ppv left a null queue, so the rpf loader never started.
+        if (iid == "{IDStorageFactory}" && m_idx == 10) {
+            uint64_t obj = make_fake_com("{IDStorageQueue}");
+            if (arg(3)) mem_.write64(arg(3), obj);
+            mst.stub_desc = "CreateQueue (*r9=queue, S_OK)";
+            if (mst.calls <= 8)
+                std::fprintf(stderr, "    [gdkobj] IDStorageFactory CreateQueue desc=0x%llx -> obj=0x%llx ret=%s\n",
+                             static_cast<unsigned long long>(arg(1)),
+                             static_cast<unsigned long long>(obj), where(ret_addr).c_str());
+            return ret(0);
+        }
 
+        // Device method 80 (vtbl+0x280) at exe+0x2482448. The out pointer is the
+        // 6th argument; the caller then uses that object. Leaving it null
+        // makes a later virtual call jump to 0.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 80) {
+            uint64_t obj = make_fake_com("{D3D12Resource}");
+            uint64_t pp = arg(5);
+            if (pp > 0x10000 && pp < (1ULL << 47)) mem_.write64(pp, obj);
+            mst.stub_desc = "m80 (*stack=resource, S_OK)";
+            if (mst.calls <= 6)
+                std::fprintf(stderr, "    [d3d12] device m80 -> resource 0x%llx at 0x%llx ret=%s\n",
+                             static_cast<unsigned long long>(obj),
+                             static_cast<unsigned long long>(pp), where(ret_addr).c_str());
+            return ret(0);
+        }
         if (iid == "{5405c344-d457-444e}" && m_idx == 15) { // ID3D12Device::GetDescriptorHandleIncrementSize
             mst.stub_desc = "GetDescriptorHandleIncrementSize -> 0x20";
             return ret(0x20);
@@ -1334,12 +1381,34 @@ void DllRunner::handle_thunk(const Thunk& t) {
         }
         // D3D12-style factory methods: (..., REFIID riid, void** ppv). If arg(i) looks like a
         // known-readable GUID and arg(i+1) is a writable pointer, hand back a new fake object.
+        // Stack slots past the real args can look like a GUID plus a code address (saved
+        // return address). Writing the object there patches the caller's epilogue.
+        auto executable_va = [&](uint64_t va) {
+            for (auto& img : loader_.images()) {
+                if (va < img.base_vaddr || va >= img.base_vaddr + img.image_size) continue;
+                uint64_t nt = img.base_vaddr + mem_.read32(img.base_vaddr + 0x3c);
+                if (mem_.read32(nt) != 0x4550) return false;
+                uint16_t nsec = mem_.read16(nt + 6);
+                uint64_t sec = nt + 24 + mem_.read16(nt + 20);
+                uint32_t rva = static_cast<uint32_t>(va - img.base_vaddr);
+                for (uint16_t s = 0; s < nsec && s < 96; ++s, sec += 40) {
+                    uint32_t sv = mem_.read32(sec + 12), sz = mem_.read32(sec + 8);
+                    if (rva >= sv && rva < sv + sz)
+                        return (mem_.read32(sec + 36) & 0x20000000u) != 0; // IMAGE_SCN_MEM_EXECUTE
+                }
+                return false;
+            }
+            return false;
+        };
         for (int i = 1; i <= 7 && iid.size() == 20 && iid[9] == '-'; ++i) {
             uint64_t riid = arg(i), ppv = arg(i + 1);
             if (riid < 0x10000 || ppv < 0x10000 || riid >= (1ULL << 47) || ppv >= (1ULL << 47)) continue;
             uint64_t lo = mem_.read64(riid), hi = mem_.read64(riid + 8);
-            if (!lo || !hi || ((hi >> 56) == 0 && (lo >> 48) == 0)) continue; // heuristic: GUID has dense high bytes
+            unsigned version = static_cast<unsigned>(lo >> 60);
+            if (!lo || !hi || version < 1 || version > 5) continue;
+            if ((hi >> 56) == 0 && (lo >> 48) == 0) continue;
             if (mem_.read64(ppv) >= (1ULL << 47)) continue;
+            if (executable_va(ppv)) continue;
             char b[48];
             std::snprintf(b, sizeof b, "{%08x-%04x-%04x}", static_cast<unsigned>(lo & 0xffffffff),
                           static_cast<unsigned>((lo >> 32) & 0xffff), static_cast<unsigned>(lo >> 48));
@@ -1647,6 +1716,11 @@ void DllRunner::handle_thunk(const Thunk& t) {
     if (is({"SetEvent"})) {
         uint64_t h = arg(0);
         if (auto it = events_.find(h); it != events_.end()) it->second.signaled = true;
+        if (g_sync_log < 24) {
+            ++g_sync_log;
+            std::fprintf(stderr, "    [sync] SetEvent h=0x%llx caller=%s\n",
+                         static_cast<unsigned long long>(h), where(mem_.read64(r.rsp)).c_str());
+        }
         return ret(1);
     }
     if (is({"ResetEvent"})) {
@@ -1720,6 +1794,12 @@ void DllRunner::handle_thunk(const Thunk& t) {
             if (arg(2)) mem_.write32(arg(2), static_cast<uint32_t>(it->second.sem_count));
             it->second.sem_count += static_cast<int64_t>(static_cast<int32_t>(arg(1)));
             it->second.signaled = it->second.sem_count > 0;
+            if (g_sync_log < 24) {
+                ++g_sync_log;
+                std::fprintf(stderr, "    [sync] ReleaseSemaphore h=0x%llx +%u count=%lld caller=%s\n",
+                             static_cast<unsigned long long>(arg(0)), static_cast<unsigned>(arg(1)),
+                             static_cast<long long>(it->second.sem_count), where(mem_.read64(r.rsp)).c_str());
+            }
         }
         return ret(1);
     }
@@ -2066,6 +2146,10 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"rand_s"})) { mem_.write32(arg(0), static_cast<uint32_t>(std::rand())); return ret(0); }
     if (is({"___mb_cur_max_func"})) return ret(1);
+    if (is({"isspace", "iswspace"})) {
+        unsigned c = static_cast<unsigned>(arg(0));
+        return ret(c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f');
+    }
     if (is({"__pctype_func"})) {
         // "C" locale ctype table (index -1..255); returned pointer is at index 0.
         static uint64_t tbl = 0;

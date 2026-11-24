@@ -266,6 +266,7 @@ bool XboxLauncher::step_run() {
         emu::kernel::Scheduler sched(mem, cpu, runner);
         sched.add_main_thread(exe->entry_point);
         uint64_t budget = max_insns_ ? max_insns_ : emu::kernel::Scheduler::kDefaultBudget;
+        runner.set_insn_budget(budget);
         sched.run(budget);
     }
 
