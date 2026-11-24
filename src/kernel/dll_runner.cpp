@@ -740,7 +740,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                  outer == 0x23caaee || outer == 0x23cf71b) &&
                 it->second.sem_count <= 0) {
                 static int gate = 0;
-                if (gate < 1) {
+                if (gate < 4) {
                     ++gate;
                     it->second.sem_count = 1;
                     it->second.signaled = true;
