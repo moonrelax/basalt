@@ -732,6 +732,25 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
         }
         if (timeout_ms == 0) {
             uint64_t ret_va = mem_.read64(cpu_.regs().rsp);
+            // The second launch wait polls the semaphore at global 0x14a210cf8
+            // through WaitForSingleObject(timeout 0). Nothing in the exe releases
+            // that global. One release lets the caller leave exe+0x23ca9f9.
+            uint64_t outer = mem_.read64(cpu_.regs().rsp + 0x30) - 0x140000000ULL;
+            if ((outer == 0x23ca9eb || outer == 0x23caa46 || outer == 0x23caa9a ||
+                 outer == 0x23caaee || outer == 0x23cf71b) &&
+                it->second.sem_count <= 0) {
+                static int gate = 0;
+                if (gate < 1) {
+                    ++gate;
+                    it->second.sem_count = 1;
+                    it->second.signaled = true;
+                    it->second.consume();
+                    std::fprintf(stderr, "    [sync] frame-gate release h=0x%llx caller=+0x%llx\n",
+                                 static_cast<unsigned long long>(handle),
+                                 static_cast<unsigned long long>(outer));
+                    return WAIT_OBJECT_0;
+                }
+            }
             static int boot_polls = 0;
             if (ret_va - 0x140000000ULL == 0x5441bec && boot_polls < 4) {
                 ++boot_polls;
