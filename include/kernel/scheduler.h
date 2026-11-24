@@ -1,0 +1,78 @@
+#pragma once
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "cpu/cpu.h"
+#include "kernel/dll_runner.h"
+#include "memory/memory_map.h"
+
+namespace emu::kernel {
+
+enum class ThreadState {
+    Ready,
+    Waiting,
+    Suspended,
+    Finished,
+    Faulted,
+};
+
+struct GuestThread {
+    uint32_t              tid        = 0;
+    uint64_t              handle     = 0;
+    uint64_t              entry      = 0;
+    uint64_t              param      = 0;
+    uint64_t              stack_top  = 0;
+    uint64_t              stack_size = 0;
+    uint64_t              teb_va     = 0;
+    cpu::Registers        regs{};
+    ThreadState           state      = ThreadState::Ready;
+    bool                  wait_all   = false;
+    std::vector<uint64_t> wait_handles;
+    uint64_t              insns      = 0;
+    uint64_t              slices     = 0;
+    uint64_t              exit_code  = 0;
+    std::string           name;
+    std::string           stop_reason;
+};
+
+// Cooperative round-robin scheduler over guest threads.
+// Each guest thread owns a saved cpu::Registers context and its own stack/TEB.
+// Context switches happen via cpu_.regs() without modifying emu::cpu::CPU.
+class Scheduler {
+public:
+    static constexpr uint64_t kDefaultQuantum = 10'000ULL;
+    static constexpr uint64_t kDefaultBudget  = 1'500'000'000ULL;
+
+    Scheduler(memory::MemoryMap& mem, cpu::CPU& cpu, DllRunner& runner);
+
+    // Register the primary executable thread (tid = 8, main stack & TEB).
+    void add_main_thread(uint64_t entry,
+                         uint64_t a1 = 0,
+                         uint64_t a2 = 0,
+                         uint64_t a3 = 0,
+                         uint64_t a4 = 0);
+
+    // Register a worker thread with its own allocated stack and TEB.
+    void add_worker_thread(const PendingThread& pt);
+
+    // Run round-robin until all threads finish/fault/block or total_budget is reached.
+    void run(uint64_t total_budget = kDefaultBudget,
+             uint64_t quantum      = kDefaultQuantum);
+
+    const std::vector<GuestThread>& threads() const { return threads_; }
+    uint64_t total_insns() const { return total_insns_; }
+
+private:
+    memory::MemoryMap&       mem_;
+    cpu::CPU&                cpu_;
+    DllRunner&               runner_;
+    std::vector<GuestThread> threads_;
+    uint64_t                 total_insns_ = 0;
+
+    void ingest_pending();
+    void wake_waiting_threads();
+    void report_thread_fault(const GuestThread& t) const;
+    void print_summary() const;
+};
+
+} // namespace emu::kernel
