@@ -19,14 +19,10 @@ MemoryRegion make_lazy_ram(uint64_t base, uint64_t size, std::string name) {
 }
 
 MemoryMap::MemoryMap() {
-    // Pre-allocate 16 GB RAM region
-    MemoryRegion ram{};
-    ram.base = 0;
-    ram.size = XBSS_RAM_SIZE;
-    ram.type = RegionType::RAM;
-    ram.name = "DRAM";
-    ram.data.resize(XBSS_RAM_SIZE, 0);
-    regions_.push_back(std::move(ram));
+    // 16 GB of guest DRAM, committed only on touch. Filling the vector up
+    // front asked this 14 GB machine for the whole block and the kernel
+    // killed the process.
+    regions_.push_back(make_lazy_ram(0, XBSS_RAM_SIZE, "DRAM"));
 }
 
 void MemoryMap::add_region(MemoryRegion region) {
