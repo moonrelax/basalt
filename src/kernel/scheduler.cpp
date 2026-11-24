@@ -309,6 +309,19 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                 continue;
             }
 
+            if (r.rip == 0) {
+                // call *reg with a null pointer. Pop the return address and
+                // continue with rax=0 instead of killing the thread.
+                r.rax = 0;
+                r.rip = mem_.read64(r.rsp);
+                r.rsp += 8;
+                static int null_calls = 0;
+                if (null_calls < 8) {
+                    ++null_calls;
+                    std::fprintf(stderr, "    [cpu] null call, resume at %s\n", runner_.where(r.rip).c_str());
+                }
+                continue;
+            }
             if (!runner_.in_image(r.rip)) {
                 // dump the last rips executed so the jump source is visible
                 for (unsigned k = 0; k < 32; ++k) {

@@ -102,6 +102,7 @@ bool should_deny_gdk_guid(const std::string& provider, const std::string& iid) {
 }
 
 std::map<const DllRunner*, GdkComState> g_gdk_states;
+static int g_sync_log = 0;
 
 std::string format_guid(const memory::MemoryMap& mem, uint64_t va) {
     if (!va) return "{null}";
@@ -724,9 +725,21 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
             return WAIT_OBJECT_0;
         }
         // timeout 0 is a poll; logging each one filled runs/ (hundreds of thousands of lines).
-        if (timeout_ms != 0) {
+        if (timeout_ms != 0 && g_sync_log < 28) {
+            ++g_sync_log;
             std::fprintf(stderr, "    [sync] WaitForSingleObject handle=0x%llx (event unsignaled) timeout=%u\n",
                          static_cast<unsigned long long>(handle), timeout_ms);
+        }
+        if (timeout_ms == 0) {
+            uint64_t ret_va = mem_.read64(cpu_.regs().rsp);
+            static int boot_polls = 0;
+            if (ret_va - 0x140000000ULL == 0x5441bec && boot_polls < 4) {
+                ++boot_polls;
+                std::fprintf(stderr, "    [sync] boot-poll h=0x%llx sig=%d sem=%lld\n",
+                             static_cast<unsigned long long>(handle),
+                             it->second.signaled ? 1 : 0,
+                             static_cast<long long>(it->second.sem_count));
+            }
         }
         if (scheduler_mode_ && timeout_ms != 0) {
             wait_req_.active = true;
@@ -1330,6 +1343,20 @@ void DllRunner::handle_thunk(const Thunk& t) {
             return ret(0);
         }
 
+        // Device method 80 (vtbl+0x280) at exe+0x2482448. The out pointer is the
+        // 6th argument; the caller then uses that object. Leaving it null
+        // makes a later virtual call jump to 0.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 80) {
+            uint64_t obj = make_fake_com("{D3D12Resource}");
+            uint64_t pp = arg(5);
+            if (pp > 0x10000 && pp < (1ULL << 47)) mem_.write64(pp, obj);
+            mst.stub_desc = "m80 (*stack=resource, S_OK)";
+            if (mst.calls <= 6)
+                std::fprintf(stderr, "    [d3d12] device m80 -> resource 0x%llx at 0x%llx ret=%s\n",
+                             static_cast<unsigned long long>(obj),
+                             static_cast<unsigned long long>(pp), where(ret_addr).c_str());
+            return ret(0);
+        }
         if (iid == "{5405c344-d457-444e}" && m_idx == 15) { // ID3D12Device::GetDescriptorHandleIncrementSize
             mst.stub_desc = "GetDescriptorHandleIncrementSize -> 0x20";
             return ret(0x20);
@@ -1689,6 +1716,11 @@ void DllRunner::handle_thunk(const Thunk& t) {
     if (is({"SetEvent"})) {
         uint64_t h = arg(0);
         if (auto it = events_.find(h); it != events_.end()) it->second.signaled = true;
+        if (g_sync_log < 24) {
+            ++g_sync_log;
+            std::fprintf(stderr, "    [sync] SetEvent h=0x%llx caller=%s\n",
+                         static_cast<unsigned long long>(h), where(mem_.read64(r.rsp)).c_str());
+        }
         return ret(1);
     }
     if (is({"ResetEvent"})) {
@@ -1762,6 +1794,12 @@ void DllRunner::handle_thunk(const Thunk& t) {
             if (arg(2)) mem_.write32(arg(2), static_cast<uint32_t>(it->second.sem_count));
             it->second.sem_count += static_cast<int64_t>(static_cast<int32_t>(arg(1)));
             it->second.signaled = it->second.sem_count > 0;
+            if (g_sync_log < 24) {
+                ++g_sync_log;
+                std::fprintf(stderr, "    [sync] ReleaseSemaphore h=0x%llx +%u count=%lld caller=%s\n",
+                             static_cast<unsigned long long>(arg(0)), static_cast<unsigned>(arg(1)),
+                             static_cast<long long>(it->second.sem_count), where(mem_.read64(r.rsp)).c_str());
+            }
         }
         return ret(1);
     }

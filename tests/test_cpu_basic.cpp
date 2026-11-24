@@ -39,6 +39,18 @@ TEST_F(CPUTest, NOP) {
     EXPECT_EQ(cpu.regs().rip, rip_before + 1);
 }
 
+TEST_F(CPUTest, CLZERO_ZerosCacheLine) {
+    // 0F 01 FC — AMD CLZERO, 64 bytes at RAX, aligned down
+    load_code(0x1000, {0x0F, 0x01, 0xFC});
+    for (int i = 0; i < 80; ++i) mem[0x2040 + i] = 0xAB;
+    cpu.regs().rax = 0x2050; // line starts at 0x2040
+    cpu.step();
+    EXPECT_FALSE(cpu.fault());
+    for (int i = 0; i < 64; ++i) EXPECT_EQ(mem[0x2040 + i], 0) << i;
+    EXPECT_EQ(mem[0x2040 + 64], 0xAB);
+    EXPECT_EQ(cpu.regs().rip, 0x1003u);
+}
+
 TEST_F(CPUTest, HLT) {
     load_code(0x1000, {0xF4}); // HLT
     cpu.step();
