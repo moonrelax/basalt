@@ -1317,6 +1317,18 @@ void DllRunner::handle_thunk(const Thunk& t) {
                              static_cast<unsigned long long>(obj), where(ret_addr).c_str());
             return ret(0);
         }
+        // CreateQueue(this, desc, riid, ppv). Called as vtbl+0x50 from exe+0x28c95c7.
+        // Returning S_OK without writing *ppv left a null queue, so the rpf loader never started.
+        if (iid == "{IDStorageFactory}" && m_idx == 10) {
+            uint64_t obj = make_fake_com("{IDStorageQueue}");
+            if (arg(3)) mem_.write64(arg(3), obj);
+            mst.stub_desc = "CreateQueue (*r9=queue, S_OK)";
+            if (mst.calls <= 8)
+                std::fprintf(stderr, "    [gdkobj] IDStorageFactory CreateQueue desc=0x%llx -> obj=0x%llx ret=%s\n",
+                             static_cast<unsigned long long>(arg(1)),
+                             static_cast<unsigned long long>(obj), where(ret_addr).c_str());
+            return ret(0);
+        }
 
         if (iid == "{5405c344-d457-444e}" && m_idx == 15) { // ID3D12Device::GetDescriptorHandleIncrementSize
             mst.stub_desc = "GetDescriptorHandleIncrementSize -> 0x20";
