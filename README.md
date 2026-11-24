@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="320"></p>
+
 # basalt
 
 An experimental Xbox Series S research emulator written in C++23.
