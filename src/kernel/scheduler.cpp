@@ -337,6 +337,12 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
             }
 
             g_rip_ring[g_rip_ring_i++ & 31] = r.rip;
+            if ((total_insns_ & 0xFFFFFFULL) == 0) {
+                std::fprintf(stderr, "  [progress] insns=%llu rip=%s\n",
+                             static_cast<unsigned long long>(total_insns_),
+                             runner_.where(r.rip).c_str());
+                std::fflush(stderr);
+            }
             for (uint64_t pa : g_probes) if (pa == r.rip) {
                 static uint32_t probe_hits = 0;
                 if (++probe_hits > 400) break;
@@ -376,6 +382,12 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
     if (total_insns_ >= total_budget) {
         std::fprintf(stderr, "  [sched] global instruction budget reached (%llu insns)\n",
                      static_cast<unsigned long long>(total_insns_));
+        std::fprintf(stderr, "  [sched] last rips:");
+        for (unsigned k = 0; k < 32; ++k) {
+            uint64_t v = g_rip_ring[(g_rip_ring_i + k) & 31];
+            if (v) std::fprintf(stderr, " %s", runner_.where(v).c_str());
+        }
+        std::fprintf(stderr, "\n");
     }
 
     runner_.set_scheduler_mode(false);

@@ -70,6 +70,9 @@ public:
     uint32_t      current_tid() const           { return current_tid_; }
     void          add_insn_count(uint64_t n)    { insn_count_ += n; }
     uint64_t      insn_count() const            { return insn_count_; }
+    // Caps call_guest / DllMain as well as the scheduler loop. Without this,
+    // one thunk (_initterm) runs until the hardcoded 1.5e9 ceiling.
+    void          set_insn_budget(uint64_t n)   { budget_ = n; }
 
     WaitRequest   take_wait_request();
     bool          take_yield_request();
