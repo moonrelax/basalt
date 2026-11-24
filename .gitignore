@@ -1,0 +1,4 @@
+build/
+graphify-out/
+*.log
+frames/
