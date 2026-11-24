@@ -323,6 +323,19 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                 continue;
             }
             if (!runner_.in_image(r.rip)) {
+                uint64_t ret = mem_.read64(r.rsp);
+                static int wild_resume = 0;
+                if (runner_.in_image(ret) && wild_resume < 24) {
+                    ++wild_resume;
+                    std::fprintf(stderr, "    [cpu] wild call rip=0x%llx rax=0x%llx resume %s\n",
+                                 static_cast<unsigned long long>(r.rip),
+                                 static_cast<unsigned long long>(r.rax),
+                                 runner_.where(ret).c_str());
+                    r.rax = 1;
+                    r.rip = ret;
+                    r.rsp += 8;
+                    continue;
+                }
                 // dump the last rips executed so the jump source is visible
                 for (unsigned k = 0; k < 32; ++k) {
                     uint64_t v = g_rip_ring[(g_rip_ring_i + k) & 31];
@@ -405,6 +418,36 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
 
     runner_.set_scheduler_mode(false);
     print_summary();
+
+    int images = 0;
+    mem_.visit_extra_ram([&](uint64_t base, const uint8_t* p, uint64_t n) {
+        if (images >= 2) return;
+        uint64_t lim = n < (64ULL << 20) ? n : (64ULL << 20);
+        for (uint64_t i = 0; i + 24 < lim; ++i) {
+            if (p[i] == 0x89 && p[i + 1] == 'P' && p[i + 2] == 'N' && p[i + 3] == 'G') {
+                uint64_t end = i + 8;
+                for (; end + 4 < lim; ++end) {
+                    if (p[end] == 'I' && p[end + 1] == 'E' && p[end + 2] == 'N' && p[end + 3] == 'D') {
+                        end += 8;
+                        break;
+                    }
+                }
+                uint64_t len = end - i;
+                if (len < 32 || len > (8ULL << 20)) continue;
+                char path[64];
+                std::snprintf(path, sizeof path, "runs/launch-%d.png", images);
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(p + i, 1, len, f);
+                    std::fclose(f);
+                    std::fprintf(stderr, "  [img] %s from guest 0x%llx (%llu bytes)\n",
+                                 path, static_cast<unsigned long long>(base + i),
+                                 static_cast<unsigned long long>(len));
+                    ++images;
+                    i = end;
+                }
+            }
+        }
+    });
 }
 
 } // namespace emu::kernel

@@ -5,6 +5,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 namespace emu::memory {
 
@@ -72,8 +73,19 @@ public:
     // Direct pointer for DMA / bulk transfers (returns nullptr for MMIO regions)
     uint8_t* raw_ptr(uint64_t paddr, uint64_t size);
 
+    // Walk RAM that is not the 16 GB DRAM vector: lazy reservations and pages
+    // materialized for addresses the guest wrote above physical RAM.
+    void visit_extra_ram(const std::function<void(uint64_t base, const uint8_t* p, uint64_t n)>& fn) const;
+
 private:
     std::vector<MemoryRegion> regions_;
+    // Addresses past physical DRAM. Xbox code places resource objects there;
+    // dropping the writes made later virtual calls read 0xDEADBEEF.
+    static constexpr uint64_t kSparsePage = 0x10000;
+    static constexpr uint64_t kSparseCap  = 512ULL << 20;
+    mutable std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> sparse_;
+    mutable uint64_t sparse_bytes_ = 0;
+    uint8_t* sparse_bytes(uint64_t paddr, bool create) const;
 
     template<typename T>
     T    read_impl (uint64_t paddr) const;

@@ -1357,6 +1357,37 @@ void DllRunner::handle_thunk(const Thunk& t) {
                              static_cast<unsigned long long>(pp), where(ret_addr).c_str());
             return ret(0);
         }
+        if (iid == "{XGTextureAddressComputer}" && m_idx == 8) {
+            uint32_t w = static_cast<uint32_t>(mem_.read64(arg(0) + 16));
+            uint32_t h = static_cast<uint32_t>(mem_.read64(arg(0) + 24));
+            uint64_t src = arg(1);
+            if (w >= 8 && w <= 3840 && h >= 8 && h <= 2160 && src > 0x10000 &&
+                static_cast<uint64_t>(w) * h * 4 <= (32ULL << 20)) {
+                bool any = false;
+                for (uint32_t i = 0; i < 64 && i < w * h; ++i)
+                    if (mem_.read32(src + i * 4)) { any = true; break; }
+                if (any) {
+                    static int dumped = 0;
+                    if (dumped < 3) {
+                        char path[64];
+                        std::snprintf(path, sizeof path, "runs/frame-%d.ppm", dumped++);
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                            for (uint32_t i = 0; i < w * h; ++i) {
+                                uint32_t px = mem_.read32(src + static_cast<uint64_t>(i) * 4);
+                                uint8_t rgb[3] = { uint8_t(px), uint8_t(px >> 8), uint8_t(px >> 16) };
+                                std::fwrite(rgb, 1, 3, f);
+                            }
+                            std::fclose(f);
+                            std::fprintf(stderr, "    [img] wrote %s %ux%u from 0x%llx\n",
+                                         path, w, h, static_cast<unsigned long long>(src));
+                        }
+                    }
+                }
+            }
+            mst.stub_desc = "texture address";
+            return ret(0);
+        }
         if (iid == "{5405c344-d457-444e}" && m_idx == 15) { // ID3D12Device::GetDescriptorHandleIncrementSize
             mst.stub_desc = "GetDescriptorHandleIncrementSize -> 0x20";
             return ret(0x20);
@@ -2385,7 +2416,15 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"XGSuggestSwizzleMode"})) return ret(0); // linear: our textures are flat
     if (is({"XGCreateTextureComputer"})) { // (const XG_RESOURCE_DESC*, XGTextureAddressComputer** out)
-        if (arg(1)) mem_.write64(arg(1), make_fake_com("{XGTextureAddressComputer}"));
+        uint64_t obj = make_fake_com("{XGTextureAddressComputer}");
+        uint64_t d = arg(0);
+        uint32_t w = d ? mem_.read32(d + 0x10) : 0;
+        uint32_t h = d ? mem_.read32(d + 0x18) : 0;
+        mem_.write64(obj + 16, w);
+        mem_.write64(obj + 24, h);
+        if (arg(1)) mem_.write64(arg(1), obj);
+        if (w >= 8 && h >= 8)
+            std::fprintf(stderr, "    [img] texture computer %ux%u\n", w, h);
         return ret(0);
     }
     if (is({"XMemAllocatePhysicalPages"})) {

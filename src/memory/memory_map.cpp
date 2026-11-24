@@ -1,6 +1,7 @@
 #include "memory/memory_map.h"
 #include <algorithm>
 #include <stdexcept>
+#include <cstdio>
 #include <cstring>
 #include <sys/mman.h>
 
@@ -62,10 +63,37 @@ MemoryMap::find_region(uint64_t paddr) const {
     return std::nullopt;
 }
 
+uint8_t* MemoryMap::sparse_bytes(uint64_t paddr, bool create) const {
+    if (paddr < XBSS_RAM_SIZE) return nullptr;
+    uint64_t key = paddr & ~(kSparsePage - 1);
+    auto it = sparse_.find(key);
+    if (it != sparse_.end()) return it->second.get();
+    if (!create || sparse_bytes_ >= kSparseCap) return nullptr;
+    auto buf = std::make_unique<uint8_t[]>(kSparsePage);
+    std::memset(buf.get(), 0, kSparsePage);
+    uint8_t* p = buf.get();
+    sparse_.emplace(key, std::move(buf));
+    sparse_bytes_ += kSparsePage;
+    if (sparse_.size() == 1)
+        std::fprintf(stderr, "  [mem] backing guest page 0x%llx (above physical RAM)\n",
+                     static_cast<unsigned long long>(key));
+    return p;
+}
+
 template<typename T>
 T MemoryMap::read_impl(uint64_t paddr) const {
     auto opt = find_region(paddr);
-    if (!opt) return static_cast<T>(0xDEADBEEFDEADBEEFULL);
+    if (!opt) {
+        if (uint8_t* p = sparse_bytes(paddr, false)) {
+            uint64_t off = paddr & (kSparsePage - 1);
+            if (off + sizeof(T) <= kSparsePage) {
+                T val;
+                std::memcpy(&val, p + off, sizeof(T));
+                return val;
+            }
+        }
+        return static_cast<T>(0xDEADBEEFDEADBEEFULL);
+    }
 
     const MemoryRegion& r = opt->get();
     uint64_t offset = paddr - r.base;
@@ -84,7 +112,14 @@ T MemoryMap::read_impl(uint64_t paddr) const {
 template<typename T>
 void MemoryMap::write_impl(uint64_t paddr, T val) {
     auto opt = find_region(paddr);
-    if (!opt) return; // bus error — TODO: raise #MC or similar
+    if (!opt) {
+        if (uint8_t* p = sparse_bytes(paddr, true)) {
+            uint64_t off = paddr & (kSparsePage - 1);
+            if (off + sizeof(T) <= kSparsePage)
+                std::memcpy(p + off, &val, sizeof(T));
+        }
+        return;
+    }
 
     MemoryRegion& r = opt->get();
     uint64_t offset = paddr - r.base;
@@ -109,9 +144,24 @@ void MemoryMap::write16(uint64_t a, uint16_t v) { write_impl(a, v); }
 void MemoryMap::write32(uint64_t a, uint32_t v) { write_impl(a, v); }
 void MemoryMap::write64(uint64_t a, uint64_t v) { write_impl(a, v); }
 
+void MemoryMap::visit_extra_ram(const std::function<void(uint64_t, const uint8_t*, uint64_t)>& fn) const {
+    for (const auto& r : regions_) {
+        if (r.name == "DRAM" || r.type == RegionType::MMIO || !r.bytes()) continue;
+        fn(r.base, r.bytes(), r.len());
+    }
+    for (const auto& [base, buf] : sparse_)
+        fn(base, buf.get(), kSparsePage);
+}
+
 uint8_t* MemoryMap::raw_ptr(uint64_t paddr, uint64_t size) {
     auto opt = find_region(paddr);
-    if (!opt) return nullptr;
+    if (!opt) {
+        if (size > kSparsePage) return nullptr;
+        uint8_t* p = sparse_bytes(paddr, false);
+        if (!p) return nullptr;
+        if ((paddr & (kSparsePage - 1)) + size > kSparsePage) return nullptr;
+        return p + (paddr & (kSparsePage - 1));
+    }
     MemoryRegion& r = opt->get();
     if (r.type == RegionType::MMIO) return nullptr;
     uint64_t offset = paddr - r.base;
