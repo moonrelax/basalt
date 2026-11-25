@@ -29,11 +29,13 @@ public:
     const Resource* resource(uint64_t obj) const;
     const DescriptorHeap* heap(uint64_t obj) const;
     const Resource* rtv(uint64_t cpu_handle) const;
+    uint64_t backbuffer() const { return backbuffer_; }
 
 private:
     std::unordered_map<uint64_t, Resource> resources_;
     std::unordered_map<uint64_t, DescriptorHeap> heaps_;
     std::unordered_map<uint64_t, uint64_t> rtvs_;
+    uint64_t backbuffer_ = 0;
 };
 
 Device& device();

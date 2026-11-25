@@ -4,6 +4,7 @@ namespace emu::gpu {
 
 void Device::add_resource(uint64_t obj, uint64_t va, uint32_t width, uint32_t height) {
     resources_[obj] = Resource{obj, va, width, height};
+    if (width == 1280 && height == 720) backbuffer_ = obj;
 }
 
 void Device::add_heap(uint64_t obj, uint64_t cpu, uint32_t count) {

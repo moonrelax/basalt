@@ -160,6 +160,10 @@ T MemoryMap::read_impl(uint64_t paddr) const {
     const MemoryRegion& r = opt->get();
     uint64_t offset = paddr - r.base;
 
+    // Identity DRAM is mapped at the guest address, with a hole left unmapped.
+    // bytes() is only the low window's start, so bytes()+paddr faults in the hole.
+    if (r.identity) return static_cast<T>(0);
+
     if (r.type == RegionType::MMIO) {
         if (r.read_cb) return static_cast<T>(r.read_cb(offset, sizeof(T)));
         return 0;
@@ -190,6 +194,7 @@ void MemoryMap::write_impl(uint64_t paddr, T val) {
     MemoryRegion& r = opt->get();
     uint64_t offset = paddr - r.base;
 
+    if (r.identity) return;
     if (r.type == RegionType::ROM) return; // silent ignore write to ROM
     if (r.type == RegionType::MMIO) {
         if (r.write_cb) r.write_cb(offset, static_cast<uint64_t>(val), sizeof(T));
@@ -261,7 +266,7 @@ uint8_t* MemoryMap::raw_ptr(uint64_t paddr, uint64_t size) {
         return p + (paddr & (kSparsePage - 1));
     }
     MemoryRegion& r = opt->get();
-    if (r.type == RegionType::MMIO) return nullptr;
+    if (r.identity || r.type == RegionType::MMIO) return nullptr;
     uint64_t offset = paddr - r.base;
     if (offset + size > r.len()) return nullptr;
     return r.bytes() + offset;

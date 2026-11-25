@@ -317,8 +317,17 @@ uint64_t DllRunner::alloc_stack(uint64_t size) {
 // msvc thread-safe statics rely on _Init_thread_epoch starting at INT_MIN from
 // this template; a zeroed slot makes every guarded static look initialized.
 void DllRunner::init_tls_slots(uint64_t tls_arr) {
+    // The executable owns TLS slot 0. Its file-system init reads that slot
+    // directly, not through AddressOfIndex. DLLs take the following slots.
+    std::vector<const LoadedImage*> order;
+    order.reserve(loader_.images().size());
+    for (auto& img : loader_.images())
+        if (img.base_vaddr == 0x140000000ULL) order.push_back(&img);
+    for (auto& img : loader_.images())
+        if (img.base_vaddr != 0x140000000ULL) order.push_back(&img);
     uint32_t idx = 0;
-    for (auto& img : loader_.images()) {
+    for (auto* imgp : order) {
+        auto& img = *imgp;
         uint64_t b   = img.base_vaddr;
         uint64_t nt  = b + mem_.read32(b + 0x3c);
         uint64_t opt = nt + 0x18;
@@ -336,6 +345,7 @@ void DllRunner::init_tls_slots(uint64_t tls_arr) {
         for (uint64_t i = 0; i < size; ++i)
             mem_.write8(blk + i, i < end - start ? mem_.read8(start + i) : 0);
         if (pidx) mem_.write32(pidx, idx);
+        if (b == 0x140000000ULL) exe_tls_slot_ = idx;
         static int logged = 0;
         if (logged++ < 4)
             std::fprintf(stderr, "  [tls] %s slot=%u size=0x%llx\n", img.name.c_str(), idx,
@@ -357,7 +367,44 @@ uint64_t DllRunner::alloc_teb(uint64_t stack_top, uint64_t stack_size, uint32_t 
     mem_.write64(teb + 0x58, tls_arr);
     mem_.write64(teb + 0x60, PEB);
     mem_.write32(teb + 0x68, 0);
+    attach_tls(teb, false);
     return teb;
+}
+
+void DllRunner::attach_tls(uint64_t teb, bool run_callbacks) {
+    if (exe_tls_slot_ == 0xFFFFFFFFu || !teb) return;
+    uint64_t arr = mem_.read64(teb + 0x58);
+    uint64_t blk = arr ? mem_.read64(arr + static_cast<uint64_t>(exe_tls_slot_) * 8) : 0;
+    if (run_callbacks && !tls_attach_ran_) {
+        tls_attach_ran_ = true;
+        uint64_t base = 0x140000000ULL;
+        uint64_t nt = base + mem_.read32(base + 0x3c);
+        uint32_t dir_rva = mem_.read32(nt + 0x18 + 0x70 + 9 * 8);
+        uint64_t cbs = dir_rva ? mem_.read64(base + dir_rva + 24) : 0;
+        uint64_t saved_gs = cpu_.regs().msr_gs_base;
+        cpu_.regs().msr_gs_base = teb;
+        for (int n = 0; n < 8 && cbs; ++n) {
+            uint64_t fn = mem_.read64(cbs + static_cast<uint64_t>(n) * 8);
+            if (!fn) break;
+            std::fprintf(stderr, "  [tls] callback %s\n", where(fn).c_str());
+            uint64_t saved_budget = budget_;
+            uint64_t saved_insns = insn_count_;
+            budget_ = saved_insns + 20'000'000ULL;
+            call_guest(fn, base, 2, 0);
+            budget_ = saved_budget;
+            insn_count_ = saved_insns;
+            if (abort_) {
+                std::fprintf(stderr, "  [tls] callback stopped, continuing\n");
+                abort_ = false;
+                break;
+            }
+        }
+        cpu_.regs().msr_gs_base = saved_gs ? saved_gs : teb;
+    }
+    if (blk) mem_.write8(blk + 8, 1);
+    if (run_callbacks)
+        std::fprintf(stderr, "  [tls] exe slot=%u flag=%u\n", exe_tls_slot_,
+                     blk ? mem_.read8(blk + 8) : 0);
 }
 
 uint64_t DllRunner::virtual_alloc(uint64_t req_addr, uint64_t size, uint32_t alloc_type) {
@@ -1291,6 +1338,18 @@ void DllRunner::handle_thunk(const Thunk& t) {
             return ret(0);
         }
         // ClearRenderTargetView(this, cpuHandle, rgba, numRects, rects).
+        if (iid == "{5b160d0f-ac1b-4185}" && (m_idx == 12 || m_idx == 13)) {
+            static int draw_logs = 0;
+            if (draw_logs < 8) {
+                ++draw_logs;
+                std::fprintf(stderr, "    [draw] %s verts=%llu inst=%llu\n",
+                             m_idx == 12 ? "DrawInstanced" : "DrawIndexed",
+                             static_cast<unsigned long long>(arg(1)),
+                             static_cast<unsigned long long>(arg(2)));
+            }
+            mst.stub_desc = "Draw";
+            return ret(0);
+        }
         if (iid == "{5b160d0f-ac1b-4185}" && m_idx == 52) {
             float color[4] = {0.f, 0.f, 0.f, 1.f};
             if (arg(2)) {
@@ -1299,8 +1358,32 @@ void DllRunner::handle_thunk(const Thunk& t) {
                     std::memcpy(&color[i], &bits, 4);
                 }
             }
-            emu::gpu::clear_render_target(mem_, arg(1), color);
+            if (!emu::gpu::clear_render_target(mem_, arg(1), color))
+                emu::gpu::clear_render_target(mem_, emu::gpu::device().backbuffer(), color);
             mst.stub_desc = "ClearRenderTargetView";
+            return ret(0);
+        }
+        // Command-list writes that target a guest GPU address. m71 stores one
+        // dword. m74 names a base the title filled in; if that memory is a
+        // full varied frame, copy it into the backbuffer the present uses.
+        if (iid == "{5b160d0f-ac1b-4185}" && (m_idx == 71 || m_idx == 74 || m_idx == 72)) {
+            uint64_t ptr = arg(1);
+            static int gpu_logs = 0;
+            if (gpu_logs < 6 && ptr > 0x10000 && ptr < memory::XBSS_RAM_SIZE) {
+                ++gpu_logs;
+                uint8_t b[32]{};
+                for (int i = 0; i < 32; ++i) b[i] = mem_.read8(ptr + i);
+                std::fprintf(stderr, "    [draw] m%d ptr=0x%llx r8=0x%llx",
+                             m_idx, static_cast<unsigned long long>(ptr),
+                             static_cast<unsigned long long>(arg(2)));
+                for (int i = 0; i < 32; ++i) std::fprintf(stderr, " %02x", b[i]);
+                std::fprintf(stderr, "\n");
+            }
+            if (m_idx == 71 && ptr > 0x10000 && ptr < memory::XBSS_RAM_SIZE)
+                mem_.write32(ptr, static_cast<uint32_t>(arg(2)));
+            if (m_idx == 74)
+                emu::gpu::blit_if_frame(mem_, ptr, emu::gpu::device().backbuffer());
+            mst.stub_desc = "gpu-address write";
             return ret(0);
         }
         if (iid == "{8efb471d-616c-4f49}" && (m_idx == 9 || m_idx == 10)) {
@@ -3170,6 +3253,8 @@ std::optional<LoadedImage> DllRunner::load_exe(const std::string& game_dir) {
     cur_base_ = img->base_vaddr;
     mem_.write64(PEB + 0x10, img->base_vaddr);
     init_tls_slots(mem_.read64(TEB + 0x58)); // main thread: exe is mapped now
+    attach_tls(TEB, true);
+    mem_.write8(0x14293ee20ULL, 0xCC);
     cpu_.clear_fault();
     std::fill(ring_.begin(), ring_.end(), 0);
     return img;

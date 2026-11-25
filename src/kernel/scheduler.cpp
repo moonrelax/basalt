@@ -598,15 +598,136 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                         }
                         // A zeroed control-byte table has no empty marker, so this
                         // probe walks the same groups forever. Return "not found".
+                        if (r.rip == 0x14293ee20ULL || r.rip == 0x14293ef6fULL) {
+                            static int mounts = 0;
+                            if (mounts < 4) {
+                                ++mounts;
+                                uint32_t idx = mem_.read32(0x146e08b2cULL);
+                                uint64_t arr = mem_.read64(r.msr_gs_base + 0x58);
+                                uint64_t blk = arr ? mem_.read64(arr + static_cast<uint64_t>(idx) * 8) : 0;
+                                std::fprintf(stderr,
+                                             "  [tls] mount %s idx=%u flag=%u\n",
+                                             runner_.where(r.rip).c_str(), idx,
+                                             blk ? mem_.read8(blk + 8) : 0);
+                            }
+                        }
+                        // A full name table never finds an empty slot and doubles
+                        // forever. Leave the insert; the caller continues.
+                        // Swiss-table groups whose control bytes are zero look full,
+                        // so the probe never inserts. Mark the current group empty.
+                        // Same grow, wider groups (stride 0x190). Past a few thousand
+                        // slots the fill never returns and no draw is recorded.
+                        // The load-factor check stays true, so every insert rebuilds the
+                        // table and the frame that would draw never runs.
+                        if (r.rip == 0x145a292efULL || r.rip == 0x141cd3defULL) {
+                            static uint32_t grow_calls = 0;
+                            if (r.rip == 0x145a292efULL) ++grow_calls;
+                            if (grow_calls > 32) {
+                                if (grow_calls == 33 && r.rip == 0x145a292efULL)
+                                    std::fprintf(stderr, "  [native] stopped hash rebuilds\n");
+                                if (r.rip == 0x145a292efULL) {
+                                    r.rip = 0x145a2935bULL;
+                                } else {
+                                    if (r.rdx > 0x10000) mem_.write8(r.rdx + 0x10, 0);
+                                    r.rip = 0x141cd3ef3ULL;
+                                }
+                            }
+                        }
+                        if (r.rip >= 0x141cd3f85ULL && r.rip < 0x141cd3f90ULL) {
+                            static uint64_t wraps = 0;
+                            wraps += n;
+                            if (wraps > 50000ULL) {
+                                r.rip = 0x141cd3f79ULL;
+                                wraps = 0;
+                            }
+                        }
+                        if (r.rip >= 0x145a2933cULL && r.rip < 0x145a2934dULL && r.rbx > 64ull * 0x190) {
+                            mem_.write32(r.rdi, 64);
+                            mem_.write32(r.rdi + 4, 0);
+                            r.r15 = 0;
+                            r.rcx = 0;
+                            r.rbx = 64ull * 0x190;
+                            static int wide_logs = 0;
+                            if (wide_logs < 4) {
+                                ++wide_logs;
+                                std::fprintf(stderr, "  [native] capped hash grow at %s\n",
+                                             runner_.where(r.rdi).c_str());
+                            }
+                        }
+                        if (r.rip >= 0x141db0579ULL && r.rip < 0x141db064dULL) {
+                            static uint64_t groups = 0;
+                            groups += n;
+                            if (groups > 100000ULL) {
+                                uint64_t cap = mem_.read32(0x1477b10b0ULL);
+                                uint64_t ptr = mem_.read64(0x1477b10b8ULL);
+                                static int hash_logs = 0;
+                                if (!ptr || ptr < 0x10000) {
+                                    // cap is non-zero but the storage pointer is null,
+                                    // so the probe reloads address 0 forever.
+                                    constexpr uint64_t kTable = 0x0A0000000ULL;
+                                    constexpr int kGroups = 16;
+                                    if (uint8_t* p = mem_.raw_ptr(kTable, kGroups * 0x90)) {
+                                        std::memset(p, 0, kGroups * 0x90);
+                                        for (int g = 0; g < kGroups; ++g)
+                                            std::memset(p + g * 0x90, 0x80, 16);
+                                    }
+                                    mem_.write32(0x1477b10b0ULL, kGroups);
+                                    mem_.write64(0x1477b10b8ULL, kTable);
+                                    ptr = kTable;
+                                    cap = kGroups;
+                                }
+                                if (hash_logs < 4) {
+                                    ++hash_logs;
+                                    uint8_t b0 = 0;
+                                    if (uint8_t* p = mem_.raw_ptr(ptr, 1)) b0 = p[0];
+                                    std::fprintf(stderr, "  [native] hash probe cap=%llu ptr=0x%llx ctrl=%02x\n",
+                                                 static_cast<unsigned long long>(cap),
+                                                 static_cast<unsigned long long>(ptr), b0);
+                                }
+                                r.rip = 0x141db0518ULL;
+                                groups = 0;
+                            }
+                        }
+                        if (r.rip >= 0x141549b6bULL && r.rip < 0x141549b90ULL) {
+                            static uint64_t lookups = 0;
+                            lookups += n;
+                            if (lookups > 50000ULL) {
+                                std::fprintf(stderr, "  [native] name lookup did not end, missing\n");
+                                r.rax = 0;
+                                r.rip = 0x141549b99ULL;
+                                lookups = 0;
+                            }
+                        }
+                        if ((r.rip >= 0x141b8e77bULL && r.rip < 0x141b8e7aaULL) ||
+                            (r.rip >= 0x141b8e833ULL && r.rip < 0x141b8e99bULL)) {
+                            static uint64_t grows = 0;
+                            grows += n;
+                            if (grows > 2000000ULL) {
+                                std::fprintf(stderr, "  [native] name-table grow did not end, leaving it\n");
+                                r.rip = 0x141b8ea60ULL;
+                                grows = 0;
+                            }
+                        }
                         if ((r.rip >= 0x14292d610ULL && r.rip < 0x14292d670ULL) ||
                             (r.rip >= 0x14292db11ULL && r.rip < 0x14292db60ULL)) {
                             static uint64_t probes = 0;
                             probes += n;
-                            if (probes > 500000000ULL) {
+                            if (probes > 4000000ULL) {
                                 std::fprintf(stderr, "  [native] hash probe did not end, leaving it\n");
                                 r.rip = 0x14292dc46ULL;
                                 probes = 0;
                             }
+                        }
+                        if (stop == cpu::NativeStop::Trap && r.rip == 0x14293ee21ULL) {
+                            uint32_t idx = mem_.read32(0x146e08b2cULL);
+                            uint64_t arr = mem_.read64(r.msr_gs_base + 0x58);
+                            uint64_t blk = arr ? mem_.read64(arr + static_cast<uint64_t>(idx) * 8) : 0;
+                            std::fprintf(stderr, "  [tls] mount enter idx=%u flag=%u gs=%llx\n",
+                                         idx, blk ? mem_.read8(blk + 8) : 0,
+                                         static_cast<unsigned long long>(r.msr_gs_base));
+                            mem_.write8(0x14293ee20ULL, 0x41);
+                            r.rip = 0x14293ee20ULL;
+                            continue;
                         }
                         if (stop == cpu::NativeStop::Trap && r.rip &&
                             runner_.loader().thunk_at(r.rip - 1))
@@ -810,15 +931,41 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                 continue;
             }
             if (!runner_.in_image(r.rip)) {
+                auto call_return = [&](uint64_t q) {
+                    if (!runner_.in_image(q) || q < 0x140000010ULL) return false;
+                    auto b = [&](int back) { return mem_.read8(q - static_cast<uint64_t>(back)); };
+                    if (b(5) == 0xE8 || b(5) == 0xE9) return true;
+                    for (int back = 2; back <= 7; ++back) {
+                        if (b(back) != 0xFF) continue;
+                        unsigned reg = (b(back - 1) >> 3) & 7;
+                        if (reg == 2 || reg == 4) return true; // call or jmp
+                    }
+                    return false;
+                };
                 uint64_t ret = mem_.read64(r.rsp);
+                if (!call_return(ret) && r.rip < 0x10000ULL) {
+                    for (int i = 1; i < 24; ++i) {
+                        uint64_t q = mem_.read64(r.rsp + static_cast<uint64_t>(i) * 8);
+                        if (!call_return(q)) continue;
+                        ret = q;
+                        r.rsp += static_cast<uint64_t>(i) * 8;
+                        break;
+                    }
+                }
                 static int wild_resume = 0;
-                if (runner_.in_image(ret) && wild_resume < 24) {
-                    ++wild_resume;
-                    std::fprintf(stderr, "    [cpu] wild call rip=0x%llx rax=0x%llx resume %s\n",
-                                 static_cast<unsigned long long>(r.rip),
-                                 static_cast<unsigned long long>(r.rax),
-                                 runner_.where(ret).c_str());
-                    r.rax = 1;
+                if (runner_.in_image(ret) && (r.rip == 0xdeadbeefdeadbeefULL || r.rip < 0x10000ULL || wild_resume < 24)) {
+                    if (r.rip != 0xdeadbeefdeadbeefULL && r.rip >= 0x10000ULL) ++wild_resume;
+                    static int wild_logs = 0;
+                    if (wild_logs < 24) {
+                        ++wild_logs;
+                        std::fprintf(stderr, "    [cpu] wild call rip=0x%llx rax=0x%llx resume %s\n",
+                                     static_cast<unsigned long long>(r.rip),
+                                     static_cast<unsigned long long>(r.rax),
+                                     runner_.where(ret).c_str());
+                    }
+                    // Poison is an empty slot. The caller at exe+0x4fac3d7
+                    // treats a non-zero result as "already done" and retries.
+                    r.rax = (r.rip == 0xdeadbeefdeadbeefULL || r.rip < 0x10000ULL) ? 0 : 1;
                     r.rip = ret;
                     r.rsp += 8;
                     continue;

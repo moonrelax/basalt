@@ -81,4 +81,38 @@ bool clear_render_target(memory::MemoryMap& mem, uint64_t cpu_handle, const floa
     return true;
 }
 
+bool blit_if_frame(memory::MemoryMap& mem, uint64_t src, uint64_t dst_obj) {
+    const Resource* dst = device().resource(dst_obj);
+    if (!dst || dst->width != 1280 || dst->height != 720 || !src) return false;
+    uint64_t bytes = static_cast<uint64_t>(dst->width) * dst->height * 4;
+    uint8_t* from = mem.raw_ptr(src, bytes);
+    uint8_t* to = mem.raw_ptr(dst->va, bytes);
+    if (!from || !to) return false;
+    uint32_t n = dst->width * dst->height;
+    uint32_t step = n / 48;
+    uint32_t first = 0;
+    bool have = false, varied = false;
+    for (uint32_t i = 0; i < n; i += step) {
+        uint32_t p = 0;
+        std::memcpy(&p, from + static_cast<uint64_t>(i) * 4, 4);
+        if ((p & 0x00ffffff) == 0) continue;
+        if (!have) { first = p; have = true; continue; }
+        if (p != first) { varied = true; break; }
+    }
+    if (!varied) return false;
+    bool run = false;
+    for (uint32_t i = 0; i + 4 < 64; ++i) {
+        uint32_t a = 0, b = 0, c = 0;
+        std::memcpy(&a, from + static_cast<uint64_t>(i) * 4, 4);
+        std::memcpy(&b, from + static_cast<uint64_t>(i + 1) * 4, 4);
+        std::memcpy(&c, from + static_cast<uint64_t>(i + 2) * 4, 4);
+        if (a && a == b && b == c) { run = true; break; }
+    }
+    if (!run) return false;
+    std::memcpy(to, from, bytes);
+    std::fprintf(stderr, "    [draw] frame at 0x%llx -> backbuffer\n",
+                 static_cast<unsigned long long>(src));
+    return true;
+}
+
 } // namespace emu::gpu

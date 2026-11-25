@@ -205,6 +205,9 @@ private:
 
     void     setup_teb_peb();
     void     init_tls_slots(uint64_t tls_arr);
+    void     attach_tls(uint64_t teb, bool run_callbacks);
+    uint32_t exe_tls_slot_ = 0xFFFFFFFFu;
+    bool     tls_attach_ran_ = false;
     uint64_t alloc(uint64_t size, uint64_t align = 16);
     uint64_t virtual_alloc(uint64_t req_addr, uint64_t size, uint32_t alloc_type);
     bool     virtual_free(uint64_t addr, uint32_t free_type);

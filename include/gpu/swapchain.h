@@ -12,4 +12,7 @@ bool present(memory::MemoryMap& mem, uint64_t resource_obj, const char* splash_p
 // ID3D12GraphicsCommandList::ClearRenderTargetView. Fills the bound resource.
 bool clear_render_target(memory::MemoryMap& mem, uint64_t cpu_handle, const float rgba[4]);
 
+// If guest memory at src looks like a finished 1280x720 frame, copy it onto dst.
+bool blit_if_frame(memory::MemoryMap& mem, uint64_t src, uint64_t dst_obj);
+
 } // namespace emu::gpu

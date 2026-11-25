@@ -133,7 +133,11 @@ basalt_native_enter:
     jmp *basalt_target(%rip)
 
 basalt_native_return:
+    movb $0, basalt_in_guest(%rip)
     movb $0, basalt_syscall_sel(%rip)
+    # The title's SIMD state is still in these registers. Keep it before
+    # the host values are put back, including when a signal landed here.
+    SAVE_YMM basalt_guest_ymm
     mov basalt_host_rsp(%rip), %rsp
     pop %r15
     pop %r14
@@ -158,9 +162,7 @@ basalt_sig_entry:
     # guest registers. Any other signal here is a host fault.
     cmp $26, %edi
     je 4f
-    mov $231, %rax
-    mov $1, %rdi
-    syscall
+    jmp host_fault_exit
 4:
     ret
 6:
@@ -249,9 +251,50 @@ basalt_sig_entry:
     mov %rcx, 160(%rdx)
     ret
 9:
-    mov $231, %rax
-    mov $1, %rdi
+    jmp host_fault_exit
+
+# edi = signal, rdx = ucontext. One line on stderr, then stop.
+host_fault_exit:
+    mov %rdx, %r8
+    mov %edi, %eax
+    mov $10, %ecx
+    xor %edx, %edx
+    div %ecx
+    add $'0', %eax
+    add $'0', %edx
+    lea hmsg(%rip), %rcx
+    mov %al, 13(%rcx)
+    mov %dl, 14(%rcx)
+    mov 168(%r8), %rax
+    lea 36(%rcx), %rdi
+    mov $16, %ecx
+1:
+    dec %rdi
+    mov %rax, %rdx
+    and $15, %edx
+    shr $4, %rax
+    cmp $10, %edx
+    jb 2f
+    add $39, %edx
+2:
+    add $'0', %edx
+    mov %dl, (%rdi)
+    dec %ecx
+    jnz 1b
+    mov $1, %eax
+    mov $2, %edi
+    lea hmsg(%rip), %rsi
+    mov $(hmsg_end - hmsg), %edx
+    syscall
+    mov $231, %eax
+    mov $1, %edi
     syscall
     hlt
+
+.section .data
+.align 8
+hmsg: .ascii "\n[host] sig=000 rip=0000000000000000\n"
+hmsg_end:
+.section .text
 
 basalt_sig_end:

@@ -128,6 +128,7 @@ NativeStop native_slice(Registers& regs) {
     arm(4000);
     basalt_native_enter(&regs.rax, regs.msr_fs_base, regs.msr_gs_base);
     arm(0);
+    std::memcpy(&regs.ymm[0], basalt_guest_ymm, 16 * 32);
     basalt_syscall_sel = 0;
     asm volatile("stmxcsr %0" : "=m"(regs.mxcsr));
     asm volatile("ldmxcsr %0" :: "m"(host_mx));
