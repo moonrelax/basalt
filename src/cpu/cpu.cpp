@@ -5,6 +5,7 @@
 namespace emu::cpu {
 
 CPU::CPU() {
+    icache_ = std::make_unique<ICacheSlot[]>(kICache);
     reset();
 }
 
@@ -22,25 +23,25 @@ void CPU::reset() {
 }
 
 uint8_t CPU::fetch8() {
-    uint8_t v = static_cast<uint8_t>(mem_read_(regs_.rip, 1));
+    uint8_t v = static_cast<uint8_t>(ld(regs_.rip, 1));
     regs_.rip += 1;
     return v;
 }
 
 uint16_t CPU::fetch16() {
-    uint16_t v = static_cast<uint16_t>(mem_read_(regs_.rip, 2));
+    uint16_t v = static_cast<uint16_t>(ld(regs_.rip, 2));
     regs_.rip += 2;
     return v;
 }
 
 uint32_t CPU::fetch32() {
-    uint32_t v = static_cast<uint32_t>(mem_read_(regs_.rip, 4));
+    uint32_t v = static_cast<uint32_t>(ld(regs_.rip, 4));
     regs_.rip += 4;
     return v;
 }
 
 uint64_t CPU::fetch64() {
-    uint64_t v = mem_read_(regs_.rip, 8);
+    uint64_t v = ld(regs_.rip, 8);
     regs_.rip += 8;
     return v;
 }
@@ -80,14 +81,27 @@ void CPU::step() {
         return;
     }
 
-    uint8_t buf[15] = {};
-    for (int i = 0; i < 15; ++i)
-        buf[i] = static_cast<uint8_t>(mem_read_(regs_.rip + i, 1));
-    DecodedInsn insn = Decoder::decode(buf, 15);
-    if (!insn.valid()) {
-        fault_ = 1; fault_rip_ = regs_.rip; halted_ = true;
-        return;
+    uint64_t rip = regs_.rip;
+    ICacheSlot& slot = icache_[static_cast<uint32_t>(rip) & (kICache - 1)];
+    const DecodedInsn* insn_p;
+    if (slot.rip == rip && slot.insn.valid()) {
+        insn_p = &slot.insn;
+    } else {
+        uint8_t buf[16] = {};
+        uint64_t lo = ld(rip, 8);
+        uint64_t hi = ld(rip + 8, 8);
+        std::memcpy(buf, &lo, 8);
+        std::memcpy(buf + 8, &hi, 8);
+        DecodedInsn decoded = Decoder::decode(buf, 15);
+        if (!decoded.valid()) {
+            fault_ = 1; fault_rip_ = rip; halted_ = true;
+            return;
+        }
+        slot.rip = rip;
+        slot.insn = decoded;
+        insn_p = &slot.insn;
     }
+    const DecodedInsn& insn = *insn_p;
     seg_base_ = insn.prefixes.seg_gs ? regs_.msr_gs_base
               : insn.prefixes.seg_fs ? regs_.msr_fs_base : 0;
     insn_rip_ = regs_.rip;

@@ -1,6 +1,9 @@
 #include <strings.h>
 #include "kernel/dll_runner.h"
 #include "kernel/xbox_gdk_stubs.h"
+#include "host/guest_window.h"
+#include "gpu/d3d12_xs.h"
+#include "gpu/swapchain.h"
 #include "cpu/mnemonic_names.h"
 #include <algorithm>
 #include <cctype>
@@ -11,6 +14,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <vector>
 
 namespace emu::kernel {
 
@@ -176,11 +180,18 @@ DllRunner::~DllRunner() {
 std::string DllRunner::describe_handle(uint64_t h) const {
     char buf[256];
     if (auto it = events_.find(h); it != events_.end()) {
-        std::snprintf(buf, sizeof(buf), "event(0x%llx, manual=%d, sig=%d, name=\"%s\")",
-                      static_cast<unsigned long long>(h),
-                      it->second.manual_reset ? 1 : 0,
-                      it->second.signaled ? 1 : 0,
-                      it->second.name.c_str());
+        if (it->second.sem_count >= 0) {
+            std::snprintf(buf, sizeof(buf), "sem(0x%llx, count=%lld, sig=%d)",
+                          static_cast<unsigned long long>(h),
+                          static_cast<long long>(it->second.sem_count),
+                          it->second.signaled ? 1 : 0);
+        } else {
+            std::snprintf(buf, sizeof(buf), "event(0x%llx, manual=%d, sig=%d, name=\"%s\")",
+                          static_cast<unsigned long long>(h),
+                          it->second.manual_reset ? 1 : 0,
+                          it->second.signaled ? 1 : 0,
+                          it->second.name.c_str());
+        }
         return buf;
     }
     if (auto it = files_.find(h); it != files_.end()) {
@@ -613,6 +624,12 @@ std::string DllRunner::resolve_host_path(const std::string& xbox_path, bool* fou
     } else if (p.size() >= 2 && p[1] == ':') {
         // Other drive letters (e.g., T:, U:, S:) also map under game_dir_ if present.
         p.erase(0, 2);
+    } else {
+        // Named mounts: common:/data/..., platformcrc:/data/tune/...
+        size_t colon = p.find(':');
+        size_t slash = p.find('/');
+        if (colon != std::string::npos && (slash == std::string::npos || colon < slash))
+            p.erase(0, colon + 1);
     }
 
     while (!p.empty() && p.front() == '/') p.erase(0, 1);
@@ -691,6 +708,9 @@ uint64_t DllRunner::open_file(const std::string& guest_path, uint32_t access, ui
 
     uint64_t h = (handle_next_ += 4);
     files_[h] = FileHandle{fp, guest_path, host_path, fsize};
+    std::string low = lower(host_path);
+    if (low.size() >= 4 && low.compare(low.size() - 4, 4, ".png") == 0)
+        emu::host::GuestWindow::instance().show_png_file(host_path.c_str());
     set_last_error(0);
     std::fprintf(stderr, "    [file] open handle=0x%llx \"%s\" -> \"%s\" (%llu bytes)\n",
                  static_cast<unsigned long long>(h),
@@ -736,6 +756,22 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
             // through WaitForSingleObject(timeout 0). Nothing in the exe releases
             // that global. One release lets the caller leave exe+0x23ca9f9.
             uint64_t outer = mem_.read64(cpu_.regs().rsp + 0x30) - 0x140000000ULL;
+            // exe+0x23cef3e polls the handle at 0x14a210ce8 and Sleep(10)s
+            // until a worker signals it. That worker dies first, so the
+            // poll never ends. One success takes the path that starts the
+            // title thread.
+            if (outer == 0x23cef43 && it->second.sem_count <= 0) {
+                static int title_gate = 0;
+                if (title_gate < 1) {
+                    ++title_gate;
+                    it->second.sem_count = 1;
+                    it->second.signaled = true;
+                    it->second.consume();
+                    std::fprintf(stderr, "    [sync] title-gate release h=0x%llx\n",
+                                 static_cast<unsigned long long>(handle));
+                    return WAIT_OBJECT_0;
+                }
+            }
             if ((outer == 0x23ca9eb || outer == 0x23caa46 || outer == 0x23caa9a ||
                  outer == 0x23caaee || outer == 0x23cf71b) &&
                 it->second.sem_count <= 0) {
@@ -758,6 +794,80 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                              static_cast<unsigned long long>(handle),
                              it->second.signaled ? 1 : 0,
                              static_cast<long long>(it->second.sem_count));
+            }
+        }
+        if (scheduler_mode_ && timeout_ms == 0xFFFFFFFFu) {
+            // Main's startup wait (exe+0x23cabf3) blocks until a worker adds
+            // one count to the word at 0x147528488. That worker never runs.
+            // One success takes the path that sets the ready flag and returns.
+            bool startup_token = false;
+            for (int i = 0; i < 32; ++i) {
+                uint64_t q = mem_.read64(cpu_.regs().rsp + static_cast<uint64_t>(i) * 8);
+                if (q - 0x140000000ULL == 0x23cabf8) startup_token = true;
+            }
+            if (startup_token) {
+                static int tokens = 0;
+                if (tokens < 1) {
+                    ++tokens;
+                    it->second.sem_count = 1;
+                    it->second.signaled = true;
+                    it->second.consume();
+                    std::fprintf(stderr, "    [sync] startup-token h=0x%llx\n",
+                                 static_cast<unsigned long long>(handle));
+                    return WAIT_OBJECT_0;
+                }
+            }
+            // The present submit at exe+0x258dba1 waits on a GPU fence our
+            // device never signals. Let a few submits through.
+            if (mem_.read64(cpu_.regs().rsp) - 0x140000000ULL == 0x258dba6) {
+                static int frames = 0;
+                if (frames < 8) {
+                    ++frames;
+                    it->second.signaled = true;
+                    it->second.consume();
+                    std::fprintf(stderr, "    [sync] present-fence h=0x%llx n=%d\n",
+                                 static_cast<unsigned long long>(handle), frames);
+                    return WAIT_OBJECT_0;
+                }
+            }
+        }
+        if (scheduler_mode_ && timeout_ms == 0xFFFFFFFFu) {
+            // The call at exe+0x43342e pushes its return address, then the
+            // sub rsp,0x28 of that function sits under it. The caller's
+            // return is at rsp+0x30. exe+0x23cf239 is the wait that posts
+            // the startup token at 0x147528488.
+            uint64_t here = mem_.read64(cpu_.regs().rsp) - 0x140000000ULL;
+            if (here == 0x433434) {
+                bool from_startup = false;
+                static int seen = 0;
+                if (seen < 2) {
+                    ++seen;
+                    std::fprintf(stderr, "    [sync] event-wait h=0x%llx stack",
+                                 static_cast<unsigned long long>(handle));
+                    for (int i = 0; i < 16; ++i) {
+                        uint64_t q = mem_.read64(cpu_.regs().rsp + static_cast<uint64_t>(i) * 8);
+                        if (q >= 0x140000000ULL && q < 0x150000000ULL)
+                            std::fprintf(stderr, " +%x:%llx", i * 8,
+                                         static_cast<unsigned long long>(q - 0x140000000ULL));
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                for (int i = 0; i < 16; ++i) {
+                    uint64_t q = mem_.read64(cpu_.regs().rsp + static_cast<uint64_t>(i) * 8);
+                    uint64_t rva = q - 0x140000000ULL;
+                    if (rva == 0x23cf23e || rva == 0x43338e) from_startup = true;
+                }
+                if (from_startup) {
+                    static int startup_event = 0;
+                    if (startup_event < 1) {
+                        ++startup_event;
+                        it->second.signaled = true;
+                        it->second.consume();
+                        std::fprintf(stderr, "    [sync] startup-event release h=0x%llx\n",
+                                     static_cast<unsigned long long>(handle));
+                        return WAIT_OBJECT_0;
+                    }
+                }
             }
         }
         if (scheduler_mode_ && timeout_ms != 0) {
@@ -857,10 +967,29 @@ bool DllRunner::take_yield_request() {
     return y;
 }
 
-bool DllRunner::in_image(uint64_t va) const {
-    for (auto& img : loader_.images())
-        if (va >= img.base_vaddr && va < img.base_vaddr + img.image_size) return true;
+bool DllRunner::image_span(uint64_t va, uint64_t& base, uint64_t& end) const {
+    const auto& imgs = loader_.images();
+    auto hit = [&](const LoadedImage& img) {
+        return va >= img.base_vaddr && va < img.base_vaddr + img.image_size;
+    };
+    if (img_hint_ >= 0 && static_cast<size_t>(img_hint_) < imgs.size() && hit(imgs[img_hint_])) {
+        base = imgs[img_hint_].base_vaddr;
+        end = base + imgs[img_hint_].image_size;
+        return true;
+    }
+    for (size_t i = 0; i < imgs.size(); ++i) {
+        if (!hit(imgs[i])) continue;
+        img_hint_ = static_cast<int>(i);
+        base = imgs[i].base_vaddr;
+        end = base + imgs[i].image_size;
+        return true;
+    }
     return false;
+}
+
+bool DllRunner::in_image(uint64_t va) const {
+    uint64_t base = 0, end = 0;
+    return image_span(va, base, end);
 }
 
 std::string DllRunner::where(uint64_t va) const {
@@ -1121,6 +1250,64 @@ void DllRunner::handle_thunk(const Thunk& t) {
             return ret(1);
         }
 
+        // ID3D12Resource::GetGPUVirtualAddress, and the queue PresentX
+        // (vtbl+0x118, called from exe+0x2482689 with the backbuffer in r9).
+        if (m_idx == 11) {
+            if (const auto* res = emu::gpu::device().resource(arg(0)))
+                return ret(res->va);
+        }
+        // ID3D12Resource::Map. Hand back the guest pixels so the title can
+        // upload an image itself. A flat clear is not shown.
+        if (m_idx == 8) {
+            if (const auto* res = emu::gpu::device().resource(arg(0))) {
+                if (arg(3) > 0x10000 && arg(3) < (1ULL << 47))
+                    mem_.write64(arg(3), res->va);
+                mst.stub_desc = "Map";
+                return ret(0);
+            }
+        }
+        if (iid == "{0ec870a6-5d7e-4c22}" && m_idx == 35) {
+            emu::gpu::present(mem_, arg(3), nullptr);
+            mst.stub_desc = "PresentX";
+            return ret(0);
+        }
+        // CreateRenderTargetView(this, resource, desc, cpuHandle). The handle
+        // comes back as the first argument of ClearRenderTargetView.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 20) {
+            uint64_t res = arg(1);
+            if (!emu::gpu::device().resource(res) && arg(2)) {
+                for (int i = 0; i < 8; ++i) {
+                    uint64_t q = mem_.read64(arg(2) + static_cast<uint64_t>(i) * 8);
+                    if (emu::gpu::device().resource(q)) { res = q; break; }
+                }
+            }
+            emu::gpu::device().bind_rtv(arg(3), res);
+            mst.stub_desc = "CreateRenderTargetView";
+            if (mst.calls <= 6) {
+                std::fprintf(stderr, "    [d3d12] rtv handle=0x%llx resource=0x%llx\n",
+                             static_cast<unsigned long long>(arg(3)),
+                             static_cast<unsigned long long>(res));
+            }
+            return ret(0);
+        }
+        // ClearRenderTargetView(this, cpuHandle, rgba, numRects, rects).
+        if (iid == "{5b160d0f-ac1b-4185}" && m_idx == 52) {
+            float color[4] = {0.f, 0.f, 0.f, 1.f};
+            if (arg(2)) {
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t bits = mem_.read32(arg(2) + static_cast<uint64_t>(i) * 4);
+                    std::memcpy(&color[i], &bits, 4);
+                }
+            }
+            emu::gpu::clear_render_target(mem_, arg(1), color);
+            mst.stub_desc = "ClearRenderTargetView";
+            return ret(0);
+        }
+        if (iid == "{8efb471d-616c-4f49}" && (m_idx == 9 || m_idx == 10)) {
+            if (const auto* heap = emu::gpu::device().heap(arg(0)))
+                return ret(heap->cpu);
+        }
+
         // IID-specific COM method stubs
         if (iid == "{ID3DBlob}") { // obj+16 = buffer, obj+24 = size
             if (m_idx == 3) return ret(mem_.read64(arg(0) + 16));
@@ -1341,6 +1528,12 @@ void DllRunner::handle_thunk(const Thunk& t) {
             static const char* kids[] = {"{IDStorageQueue}", "{IDStorageFile}", "{IDStorageStatusArray}"};
             uint64_t obj = make_fake_com(kids[m_idx - 3]);
             if (arg(3)) mem_.write64(arg(3), obj);
+            if (m_idx == 4) {
+                std::string path = read_str(arg(1), true);
+                if (path.empty()) path = read_str(arg(1), false);
+                uint64_t h = open_file(path, 0x80000000u, 3);
+                if (h != INVALID_HANDLE_VAL) ds_files_[obj] = h;
+            }
             mst.stub_desc = "create child fake COM (*r9=obj, S_OK)";
             if (mst.calls <= 10)
                 std::fprintf(stderr, "    [gdkobj] %s m%d arg1=0x%llx ppv=0x%llx -> %s obj=0x%llx ret=%s\n",
@@ -1361,19 +1554,102 @@ void DllRunner::handle_thunk(const Thunk& t) {
                              static_cast<unsigned long long>(obj), where(ret_addr).c_str());
             return ret(0);
         }
+        // Xbox enqueue. The request built at exe+0x4ffd7df is:
+        //   +0x00 flags, +0x08 destination, +0x18 size,
+        //   +0x20 source, +0x28 source offset.
+        // flags 0 and 1 are plain copies (1 is the sized-read bit the loader
+        // sets). Anything higher is a compressed request and is left alone.
+        if (iid == "{IDStorageQueue}" && m_idx == 3) {
+            uint64_t req = arg(1);
+            uint64_t dest = mem_.read64(req + 0x08);
+            uint32_t size = mem_.read32(req + 0x18);
+            uint64_t file_obj = mem_.read64(req + 0x20);
+            uint64_t offset = mem_.read64(req + 0x28);
+            auto fit = ds_files_.find(file_obj);
+            static int ds_logs = 0;
+            if (fit != ds_files_.end() && size && size <= (128u << 20)) {
+                auto ft = files_.find(fit->second);
+                if (ft != files_.end() && ft->second.fp &&
+                    fseeko(ft->second.fp, static_cast<off_t>(offset), SEEK_SET) == 0) {
+                    size_t got = 0;
+                    if (uint8_t* d = mem_.raw_ptr(dest, size))
+                        got = std::fread(d, 1, size, ft->second.fp);
+                    if (ds_logs < 8) {
+                        ++ds_logs;
+                        uint64_t head = got >= 8 ? mem_.read64(dest) : 0;
+                        std::fprintf(stderr,
+                                     "    [ds] read \"%s\" off=0x%llx size=%u got=%zu head=0x%llx -> 0x%llx\n",
+                                     ft->second.guest_path.c_str(),
+                                     static_cast<unsigned long long>(offset), size, got,
+                                     static_cast<unsigned long long>(head),
+                                     static_cast<unsigned long long>(dest));
+                    }
+                }
+            } else if (ds_logs < 8) {
+                ++ds_logs;
+                std::fprintf(stderr,
+                             "    [ds] enqueue no file obj=0x%llx dest=0x%llx off=0x%llx size=%u\n",
+                             static_cast<unsigned long long>(file_obj),
+                             static_cast<unsigned long long>(dest),
+                             static_cast<unsigned long long>(offset), size);
+            }
+            mst.stub_desc = "EnqueueRequest";
+            return ret(0);
+        }
+        // The loader polls IsComplete (m3) and only then uses the bytes.
+        // The read already finished inside EnqueueRequest, so this is done.
+        if (iid == "{IDStorageStatusArray}" && m_idx == 3) return ret(1);
+        if (iid == "{IDStorageStatusArray}" && m_idx == 4) return ret(0);
 
+        auto resource_extent = [&](uint64_t desc, uint32_t& w, uint32_t& h) {
+            w = h = 0;
+            if (desc < 0x10000 || desc >= (1ULL << 47)) return;
+            w = mem_.read32(desc + 0x10);
+            h = mem_.read32(desc + 0x18);
+            if (w < 16 || h < 16 || w > 3840 || h > 2160) { w = 0; h = 0; }
+        };
+        auto track_resource = [&](uint64_t obj, uint32_t w, uint32_t h) {
+            if (!w || !h) { w = 1280; h = 720; }
+            uint64_t va = alloc(static_cast<uint64_t>(w) * h * 4, 256);
+            emu::gpu::device().add_resource(obj, va, w, h);
+            std::fprintf(stderr, "    [d3d12] resource 0x%llx %ux%u va=0x%llx\n",
+                         static_cast<unsigned long long>(obj), w, h,
+                         static_cast<unsigned long long>(va));
+        };
+        // CreateDescriptorHeap(this, desc, riid, ppv). Method 9/10 on the heap
+        // are the CPU and GPU descriptor-handle starts.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 14) {
+            uint64_t obj = make_fake_com("{8efb471d-616c-4f49}");
+            uint32_t count = mem_.read32(arg(1) + 4);
+            if (count == 0 || count > 1'000'000) count = 64;
+            uint64_t cpu = alloc(static_cast<uint64_t>(count) * 0x20, 64);
+            emu::gpu::device().add_heap(obj, cpu, count);
+            if (arg(3)) mem_.write64(arg(3), obj);
+            mst.stub_desc = "CreateDescriptorHeap";
+            return ret(0);
+        }
+        // CreateCommittedResource(..., desc, ..., riid, ppv). riid is arg 6.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 27) {
+            uint32_t w = 0, h = 0;
+            resource_extent(arg(3), w, h);
+            uint64_t obj = make_fake_com("{696442be-a72e-4059}");
+            track_resource(obj, w, h);
+            if (arg(7)) mem_.write64(arg(7), obj);
+            mst.stub_desc = "CreateCommittedResource";
+            return ret(0);
+        }
         // Device method 80 (vtbl+0x280) at exe+0x2482448. The out pointer is the
-        // 6th argument; the caller then uses that object. Leaving it null
-        // makes a later virtual call jump to 0.
+        // 6th argument; the caller then presents that object from the queue.
         if (iid == "{5405c344-d457-444e}" && m_idx == 80) {
+            uint32_t w = 0, h = 0;
+            resource_extent(arg(1), w, h);
+            if (!w) resource_extent(arg(2), w, h);
+            if (!w) resource_extent(arg(4), w, h);
             uint64_t obj = make_fake_com("{D3D12Resource}");
+            track_resource(obj, w, h);
             uint64_t pp = arg(5);
             if (pp > 0x10000 && pp < (1ULL << 47)) mem_.write64(pp, obj);
             mst.stub_desc = "m80 (*stack=resource, S_OK)";
-            if (mst.calls <= 6)
-                std::fprintf(stderr, "    [d3d12] device m80 -> resource 0x%llx at 0x%llx ret=%s\n",
-                             static_cast<unsigned long long>(obj),
-                             static_cast<unsigned long long>(pp), where(ret_addr).c_str());
             return ret(0);
         }
         if (iid == "{XGTextureAddressComputer}" && m_idx == 8) {
@@ -1386,6 +1662,17 @@ void DllRunner::handle_thunk(const Thunk& t) {
                 for (uint32_t i = 0; i < 64 && i < w * h; ++i)
                     if (mem_.read32(src + i * 4)) { any = true; break; }
                 if (any) {
+                    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+                    for (uint32_t i = 0; i < w * h; ++i) {
+                        uint32_t px = mem_.read32(src + static_cast<uint64_t>(i) * 4);
+                        rgba[i * 4 + 0] = static_cast<uint8_t>(px);
+                        rgba[i * 4 + 1] = static_cast<uint8_t>(px >> 8);
+                        rgba[i * 4 + 2] = static_cast<uint8_t>(px >> 16);
+                        rgba[i * 4 + 3] = 255;
+                    }
+                    emu::host::GuestWindow::instance().show_rgba(rgba.data(),
+                                                                 static_cast<int>(w),
+                                                                 static_cast<int>(h));
                     static int dumped = 0;
                     if (dumped < 3) {
                         char path[64];
@@ -1411,7 +1698,15 @@ void DllRunner::handle_thunk(const Thunk& t) {
             mst.stub_desc = "GetDescriptorHandleIncrementSize -> 0x20";
             return ret(0x20);
         }
-        if (iid == "{5405c344-d457-444e}" && m_idx == 24) { // CopyDescriptorsSimple: void
+        if (iid == "{5405c344-d457-444e}" && m_idx == 24) { // CopyDescriptorsSimple
+            uint32_t n = static_cast<uint32_t>(arg(1));
+            if (n > 256) n = 256;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint64_t src = arg(3) + static_cast<uint64_t>(i) * 0x20;
+                uint64_t dst = arg(2) + static_cast<uint64_t>(i) * 0x20;
+                if (const auto* res = emu::gpu::device().rtv(src))
+                    emu::gpu::device().bind_rtv(dst, res->obj);
+            }
             mst.stub_desc = "CopyDescriptorsSimple";
             return ret(0);
         }
@@ -1428,6 +1723,22 @@ void DllRunner::handle_thunk(const Thunk& t) {
             mem_.write64(out + 8, al);
             mst.stub_desc = "GetResourceAllocationInfo";
             return ret(out);
+        }
+        // The call at exe+0x17f6d34 is CreateCommandList. The IID sits in
+        // arg 4 and the out pointer in arg 5, and the slot is prefilled with
+        // a poison pointer, so the generic scan leaves it alone. The next
+        // instruction then calls through that poison.
+        if (iid == "{5405c344-d457-444e}" && m_idx == 73 &&
+            ret_addr == 0x1417f6d3bULL) {
+            uint64_t ppv = arg(5);
+            uint64_t obj = make_fake_com("{5b160d0f-ac1b-4185}");
+            if (ppv > 0x10000 && ppv < (1ULL << 47)) mem_.write64(ppv, obj);
+            mst.stub_desc = "CreateCommandList";
+            if (mst.calls <= 4)
+                std::fprintf(stderr, "    [d3d12] command list -> 0x%llx ppv=0x%llx\n",
+                             static_cast<unsigned long long>(obj),
+                             static_cast<unsigned long long>(ppv));
+            return ret(0);
         }
         // D3D12-style factory methods: (..., REFIID riid, void** ppv). If arg(i) looks like a
         // known-readable GUID and arg(i+1) is a writable pointer, hand back a new fake object.
@@ -1457,12 +1768,16 @@ void DllRunner::handle_thunk(const Thunk& t) {
             unsigned version = static_cast<unsigned>(lo >> 60);
             if (!lo || !hi || version < 1 || version > 5) continue;
             if ((hi >> 56) == 0 && (lo >> 48) == 0) continue;
-            if (mem_.read64(ppv) >= (1ULL << 47)) continue;
+            // 0xdeadbeefdeadbeef is the title's empty out-slot, not a live pointer.
+            uint64_t slot = mem_.read64(ppv);
+            if (slot >= (1ULL << 47) && slot != 0xdeadbeefdeadbeefULL) continue;
             if (executable_va(ppv)) continue;
             char b[48];
             std::snprintf(b, sizeof b, "{%08x-%04x-%04x}", static_cast<unsigned>(lo & 0xffffffff),
                           static_cast<unsigned>((lo >> 32) & 0xffff), static_cast<unsigned>(lo >> 48));
             uint64_t obj = make_fake_com(b);
+            if (std::strncmp(b, "{696442be", 10) == 0)
+                track_resource(obj, 0, 0);
             mem_.write64(ppv, obj);
             mst.stub_desc = "riid/ppv child fake COM";
             if (mst.calls <= 10)
@@ -1822,7 +2137,19 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"SuspendThread"})) return ret(0);
     if (is({"Sleep", "SleepEx", "SwitchToThread"})) {
-        if (scheduler_mode_) yield_requested_ = true;
+        uint32_t ms = (n == "SwitchToThread") ? 0u : static_cast<uint32_t>(arg(0));
+        if (ms == 0 || !scheduler_mode_) {
+            if (scheduler_mode_) yield_requested_ = true;
+            return ret(0);
+        }
+        // 10 MHz counter, same frequency QueryPerformanceFrequency reports.
+        // The thread stays asleep until that tick, so a frame pump that
+        // sleeps a whole second does not eat the loader.
+        uint64_t ticks = static_cast<uint64_t>(ms) * 10000ULL;
+        if (ms == 0xFFFFFFFFu) ticks = 0x7fffffffffffffffULL;
+        wait_req_.active = true;
+        wait_req_.sleep_until = guest_qpc_ + ticks;
+        wait_req_.wake_rax = 0;
         return ret(0);
     }
     if (is({"SetThreadPriority", "GetThreadPriority", "SetThreadGroupAffinity", "GetThreadGroupAffinity",
@@ -1833,7 +2160,40 @@ void DllRunner::handle_thunk(const Thunk& t) {
     if (is({"EnterCriticalSection", "LeaveCriticalSection", "DeleteCriticalSection",
             "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "AcquireSRWLockShared",
             "ReleaseSRWLockShared", "InitializeSRWLock", "InitializeSListHead",
-            "InitializeConditionVariable", "WakeAllConditionVariable", "WakeConditionVariable"})) return ret(0);
+            "InitializeConditionVariable"})) return ret(0);
+    if (is({"WakeConditionVariable", "WakeAllConditionVariable"})) {
+        uint64_t cv = arg(0);
+        if (auto it = events_.find(cv); it != events_.end()) it->second.signaled = true;
+        return ret(0);
+    }
+    if (is({"SleepConditionVariableCS", "SleepConditionVariableSRW"})) {
+        uint64_t cv = arg(0);
+        uint32_t timeout_ms = static_cast<uint32_t>(arg(2));
+        auto& ev = events_[cv];
+        if (ev.signaled) {
+            ev.consume();
+            return ret(1);
+        }
+        if (timeout_ms == 0) {
+            set_last_error(0x5B4); // ERROR_TIMEOUT
+            return ret(0);
+        }
+        if (scheduler_mode_) {
+            static int cv_logs = 0;
+            if (cv_logs < 4) {
+                ++cv_logs;
+                std::fprintf(stderr, "    [sync] SleepConditionVariable cv=0x%llx timeout=%u\n",
+                             static_cast<unsigned long long>(cv), timeout_ms);
+            }
+            wait_req_.active = true;
+            wait_req_.wait_all = false;
+            wait_req_.wake_rax = 1;
+            wait_req_.handles = {cv};
+            return ret(1);
+        }
+        set_last_error(0x5B4);
+        return ret(0);
+    }
     if (is({"TryAcquireSRWLockExclusive", "TryEnterCriticalSection"})) return ret(1);
     if (is({"ReleaseMutex"})) {
         if (auto it = events_.find(arg(0)); it != events_.end()) it->second.signaled = true;
@@ -1994,9 +2354,9 @@ void DllRunner::handle_thunk(const Thunk& t) {
     if (is({"GetLastError"})) return ret(get_last_error());
     if (is({"SetLastError"})) { set_last_error(static_cast<uint32_t>(arg(0))); return ret(0); }
 
-    if (is({"QueryPerformanceCounter"})) { mem_.write64(arg(0), insn_count_ * 10); return ret(1); }
+    if (is({"QueryPerformanceCounter"})) { mem_.write64(arg(0), guest_qpc_); return ret(1); }
     if (is({"QueryPerformanceFrequency"})) { mem_.write64(arg(0), 10'000'000); return ret(1); }
-    if (is({"GetTickCount64", "GetTickCount"})) return ret(insn_count_ / 1000);
+    if (is({"GetTickCount64", "GetTickCount"})) return ret(guest_qpc_ / 10000);
     if (is({"GetCurrentThreadId"})) return ret(current_tid_);
     if (is({"GetCurrentProcessId", "GetProcessId"})) return ret(4);
     if (is({"GetCurrentThread"})) return ret(~1ULL);
@@ -2153,6 +2513,64 @@ void DllRunner::handle_thunk(const Thunk& t) {
         uint64_t i = 0;
         for (uint8_t c; (c = mem_.read8(arg(1) + i)); ++i) mem_.write8(arg(0) + i, c);
         mem_.write8(arg(0) + i, 0);
+        return ret(arg(0));
+    }
+    if (is({"strncpy"})) {
+        uint64_t n = arg(2), i = 0;
+        for (; i < n; ++i) {
+            uint8_t c = mem_.read8(arg(1) + i);
+            mem_.write8(arg(0) + i, c);
+            if (!c) {
+                for (++i; i < n; ++i) mem_.write8(arg(0) + i, 0);
+                break;
+            }
+        }
+        return ret(arg(0));
+    }
+    if (is({"strcat", "strncat"})) {
+        uint64_t lim = n == "strncat" ? arg(2) : ~0ULL;
+        uint64_t d = arg(0);
+        while (mem_.read8(d)) ++d;
+        uint64_t i = 0;
+        for (; i < lim; ++i) {
+            uint8_t c = mem_.read8(arg(1) + i);
+            if (!c) break;
+            mem_.write8(d + i, c);
+        }
+        mem_.write8(d + i, 0);
+        return ret(arg(0));
+    }
+    if (is({"wcslen"})) {
+        uint64_t i = 0;
+        while (mem_.read16(arg(0) + i * 2)) ++i;
+        return ret(i);
+    }
+    if (is({"wcscpy", "wcsncpy"})) {
+        bool bounded = n == "wcsncpy";
+        uint64_t lim = bounded ? arg(2) : ~0ULL;
+        uint64_t i = 0;
+        for (; i < lim; ++i) {
+            uint16_t c = mem_.read16(arg(1) + i * 2);
+            mem_.write16(arg(0) + i * 2, c);
+            if (!c) {
+                if (bounded)
+                    for (++i; i < lim; ++i) mem_.write16(arg(0) + i * 2, 0);
+                break;
+            }
+        }
+        return ret(arg(0));
+    }
+    if (is({"wcscat", "wcsncat"})) {
+        uint64_t lim = n == "wcsncat" ? arg(2) : ~0ULL;
+        uint64_t d = arg(0);
+        while (mem_.read16(d)) d += 2;
+        uint64_t i = 0;
+        for (; i < lim; ++i) {
+            uint16_t c = mem_.read16(arg(1) + i * 2);
+            if (!c) break;
+            mem_.write16(d + i * 2, c);
+        }
+        mem_.write16(d + i * 2, 0);
         return ret(arg(0));
     }
     if (is({"strtok_s"})) {
@@ -2519,7 +2937,97 @@ void DllRunner::handle_thunk(const Thunk& t) {
         for (int i = 0; i < 8; ++i) mem_.write16(arg(1) + i * 2, st[i]);
         return ret(1);
     }
-    if (is({"FindFirstFileW", "FindFirstFileA"})) { set_last_error(2); return ret(~0ULL); }
+    if (is({"FindFirstFileW", "FindFirstFileA", "FindFirstFileExW", "FindFirstFileExA"})) {
+        namespace fs = std::filesystem;
+        bool ex = n.find("Ex") != std::string::npos;
+        bool wide = n.back() == 'W';
+        uint64_t data = ex ? arg(2) : arg(1);
+        std::string pat = read_str(arg(0), wide);
+        std::replace(pat.begin(), pat.end(), '\\', '/');
+        auto slash = pat.find_last_of('/');
+        std::string dirpart = slash == std::string::npos ? std::string{} : pat.substr(0, slash);
+        std::string glob = slash == std::string::npos ? pat : pat.substr(slash + 1);
+        if (glob.empty()) glob = "*";
+        bool exists = false;
+        std::string host_dir = resolve_host_path(dirpart.empty() ? std::string{} : dirpart, &exists);
+        if (dirpart.empty()) {
+            host_dir = game_dir_;
+            exists = !game_dir_.empty();
+        }
+        auto match = [](const std::string& gpat, const std::string& name) {
+            std::string p = lower(gpat), s = lower(name);
+            size_t pi = 0, si = 0, star = std::string::npos, mark = 0;
+            while (si < s.size()) {
+                if (pi < p.size() && (p[pi] == '?' || p[pi] == s[si])) { ++pi; ++si; }
+                else if (pi < p.size() && p[pi] == '*') { star = pi++; mark = si; }
+                else if (star != std::string::npos) { pi = star + 1; si = ++mark; }
+                else return false;
+            }
+            while (pi < p.size() && p[pi] == '*') ++pi;
+            return pi == p.size();
+        };
+        auto write_find = [&](uint64_t va, const FindEntry& e) {
+            if (va < 0x10000) return;
+            int nbytes = wide ? 592 : 320;
+            for (int i = 0; i < nbytes; ++i) mem_.write8(va + i, 0);
+            mem_.write32(va + 0, e.dir ? 0x10u : 0x20u);
+            mem_.write32(va + 28, static_cast<uint32_t>(e.size >> 32));
+            mem_.write32(va + 32, static_cast<uint32_t>(e.size));
+            if (wide) write_wstr(va + 44, e.name);
+            else write_cstr(va + 44, e.name);
+        };
+        FindState st;
+        st.wide = wide;
+        std::error_code ec;
+        if (exists && fs::is_directory(host_dir, ec)) {
+            if (match(glob, ".")) st.entries.push_back({".", 0, true});
+            if (match(glob, "..")) st.entries.push_back({"..", 0, true});
+            for (const auto& ent : fs::directory_iterator(host_dir, ec)) {
+                std::string name = ent.path().filename().string();
+                if (!match(glob, name)) continue;
+                bool dir = ent.is_directory(ec);
+                uint64_t sz = dir ? 0 : static_cast<uint64_t>(ent.file_size(ec));
+                st.entries.push_back({name, sz, dir});
+            }
+        }
+        std::fprintf(stderr, "    [file] find \"%s\" -> %zu\n",
+                     pat.c_str(), st.entries.size());
+        if (st.entries.empty()) {
+            set_last_error(2);
+            return ret(~0ULL);
+        }
+        write_find(data, st.entries[0]);
+        st.index = 1;
+        uint64_t h = (handle_next_ += 4);
+        finds_[h] = std::move(st);
+        set_last_error(0);
+        return ret(h);
+    }
+    if (is({"FindNextFileW", "FindNextFileA"})) {
+        auto it = finds_.find(arg(0));
+        if (it == finds_.end() || it->second.index >= it->second.entries.size()) {
+            set_last_error(18);
+            return ret(0);
+        }
+        const FindEntry& e = it->second.entries[it->second.index++];
+        uint64_t va = arg(1);
+        bool wide = n.back() == 'W';
+        if (va >= 0x10000) {
+            int nbytes = wide ? 592 : 320;
+            for (int i = 0; i < nbytes; ++i) mem_.write8(va + i, 0);
+            mem_.write32(va + 0, e.dir ? 0x10u : 0x20u);
+            mem_.write32(va + 28, static_cast<uint32_t>(e.size >> 32));
+            mem_.write32(va + 32, static_cast<uint32_t>(e.size));
+            if (wide) write_wstr(va + 44, e.name);
+            else write_cstr(va + 44, e.name);
+        }
+        set_last_error(0);
+        return ret(1);
+    }
+    if (is({"FindClose"})) {
+        finds_.erase(arg(0));
+        return ret(1);
+    }
     if (is({"CreateDirectoryW", "CreateDirectoryA"})) return ret(1);
 
     for (auto& s : XboxGdkStubs::stubs())

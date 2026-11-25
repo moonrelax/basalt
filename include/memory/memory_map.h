@@ -42,6 +42,8 @@ struct MemoryRegion {
     std::vector<uint8_t> data;
     // Optional lazy backing (mmap MAP_NORESERVE) used instead of `data`, sized `size`.
     std::shared_ptr<uint8_t> ext;
+    // Guest address and host address are the same. `ext` is not a base pointer.
+    bool identity = false;
     uint8_t*       bytes()       { return ext ? ext.get() : data.data(); }
     const uint8_t* bytes() const { return ext ? ext.get() : data.data(); }
     uint64_t       len()   const { return ext ? size : data.size(); }
@@ -72,10 +74,24 @@ public:
 
     // Direct pointer for DMA / bulk transfers (returns nullptr for MMIO regions)
     uint8_t* raw_ptr(uint64_t paddr, uint64_t size);
+    // Base of the flat 16 GB mapping, or null before it exists.
+    uint8_t* dram_base() {
+        if (regions_.empty() || regions_[0].base != 0) return nullptr;
+        return regions_[0].bytes();
+    }
+    uint64_t dram_bytes() const {
+        if (regions_.empty() || regions_[0].base != 0) return 0;
+        return regions_[0].len();
+    }
+    bool identity() const {
+        return !regions_.empty() && regions_[0].identity;
+    }
 
     // Walk RAM that is not the 16 GB DRAM vector: lazy reservations and pages
     // materialized for addresses the guest wrote above physical RAM.
     void visit_extra_ram(const std::function<void(uint64_t base, const uint8_t* p, uint64_t n)>& fn) const;
+    // Pages of the 16 GB DRAM mapping that the kernel has actually committed.
+    void visit_resident_dram(const std::function<void(uint64_t base, const uint8_t* p, uint64_t n)>& fn) const;
 
 private:
     std::vector<MemoryRegion> regions_;
@@ -86,6 +102,9 @@ private:
     mutable std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> sparse_;
     mutable uint64_t sparse_bytes_ = 0;
     uint8_t* sparse_bytes(uint64_t paddr, bool create) const;
+    // Guest RAM outside the MMIO hole. Null when the range is not plain DRAM.
+    uint8_t* dram_fast(uint64_t paddr, uint64_t n);
+    const uint8_t* dram_fast(uint64_t paddr, uint64_t n) const;
 
     template<typename T>
     T    read_impl (uint64_t paddr) const;

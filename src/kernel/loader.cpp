@@ -182,7 +182,7 @@ uint64_t Loader::make_thunk(const std::string& module, const std::string& name) 
     uint64_t addr = THUNK_BASE + thunks_.size() * THUNK_STRIDE;
     thunks_.push_back({module, name});
     thunk_index_[key] = addr;
-    mem_.write8(addr, 0xF4); // HLT: safety net if the run loop misses it
+    mem_.write8(addr, 0xCC); // int3: native execution traps back into the HLE thunk
     return addr;
 }
 
@@ -190,6 +190,11 @@ const Thunk* Loader::thunk_at(uint64_t addr) const {
     if (addr < THUNK_BASE || (addr - THUNK_BASE) % THUNK_STRIDE) return nullptr;
     uint64_t i = (addr - THUNK_BASE) / THUNK_STRIDE;
     return i < thunks_.size() ? &thunks_[i] : nullptr;
+}
+
+void Loader::plant_traps(memory::MemoryMap& mem) const {
+    for (size_t i = 0; i < thunks_.size(); ++i)
+        mem.write8(THUNK_BASE + static_cast<uint64_t>(i) * THUNK_STRIDE, 0xCC);
 }
 
 bool Loader::load_raw(const std::string& path, uint64_t load_addr) {

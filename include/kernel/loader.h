@@ -104,6 +104,8 @@ public:
     std::optional<uint64_t> find_export(const std::string& name) const;
     uint64_t make_thunk(const std::string& module, const std::string& name);
     const Thunk* thunk_at(uint64_t addr) const;
+    // int3 at each import thunk so native execution traps back into HLE.
+    void plant_traps(memory::MemoryMap& mem) const;
     const std::vector<LoadedImage>& images() const { return images_; }
 
 private:

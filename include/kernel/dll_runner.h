@@ -25,8 +25,10 @@ struct PendingThread {
 };
 
 struct WaitRequest {
-    bool                  active   = false;
-    bool                  wait_all = false;
+    bool                  active      = false;
+    bool                  wait_all    = false;
+    uint64_t              wake_rax    = 0; // value rax gets when the wait is released
+    uint64_t              sleep_until = 0; // guest QPC tick that ends a Sleep
     std::vector<uint64_t> handles;
 };
 
@@ -62,13 +64,18 @@ public:
     Loader&       loader()       { return loader_; }
     const Loader& loader() const { return loader_; }
     bool          in_image(uint64_t va) const;
+    // Image that contains va. Hot loops stay inside one image, so the
+    // scheduler can run a burst with a single range check.
+    bool          image_span(uint64_t va, uint64_t& base, uint64_t& end) const;
     void          handle_thunk(const Thunk& t);
     std::string   where(uint64_t va) const;
 
     void          set_scheduler_mode(bool on)   { scheduler_mode_ = on; }
     void          set_current_tid(uint32_t tid) { current_tid_ = tid; }
     uint32_t      current_tid() const           { return current_tid_; }
-    void          add_insn_count(uint64_t n)    { insn_count_ += n; }
+    void          add_insn_count(uint64_t n)    { insn_count_ += n; guest_qpc_ += n * 10; }
+    uint64_t      guest_qpc() const             { return guest_qpc_; }
+    void          advance_qpc_to(uint64_t tick) { if (tick > guest_qpc_) guest_qpc_ = tick; }
     uint64_t      insn_count() const            { return insn_count_; }
     // Caps call_guest / DllMain as well as the scheduler loop. Without this,
     // one thunk (_initterm) runs until the hardcoded 1.5e9 ceiling.
@@ -96,6 +103,7 @@ public:
     void          dump_milestones() const;
 
 private:
+    mutable int img_hint_ = -1;
     enum class Stop { Returned, Fault, Halt, WildJump, Budget, Aborted };
 
     struct FileHandle {
@@ -103,6 +111,17 @@ private:
         std::string guest_path;
         std::string host_path;
         uint64_t    size = 0;
+    };
+
+    struct FindEntry {
+        std::string name;
+        uint64_t    size = 0;
+        bool        dir  = false;
+    };
+    struct FindState {
+        bool                   wide = false;
+        std::vector<FindEntry> entries;
+        size_t                 index = 0;
     };
 
     struct EventObj {
@@ -159,6 +178,7 @@ private:
     bool     scheduler_mode_  = false;
     bool     yield_requested_ = false;
     uint64_t insn_count_  = 0;
+    uint64_t guest_qpc_   = 0;
     uint64_t budget_      = 20'000'000ULL;
     int      thunk_log_   = 0;
     int      read_log_    = 0;
@@ -167,6 +187,8 @@ private:
     Stop     last_stop_   = Stop::Returned;
 
     std::map<uint64_t, FileHandle>   files_;
+    std::map<uint64_t, FindState>    finds_;
+    std::map<uint64_t, uint64_t>     ds_files_; // IDStorageFile object -> files_ handle
     std::map<uint64_t, EventObj>     events_;
     std::map<uint64_t, TaskQueueObj> task_queues_;
     std::vector<PendingThread>       pending_threads_;

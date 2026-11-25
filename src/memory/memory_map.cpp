@@ -3,13 +3,55 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 #include <sys/mman.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 namespace emu::memory {
+
+namespace {
+struct IdentityHold {
+    void* lo = nullptr;
+    size_t lo_n = 0;
+    void* hi = nullptr;
+    size_t hi_n = 0;
+    ~IdentityHold() {
+        if (lo && lo != MAP_FAILED) munmap(lo, lo_n);
+        if (hi && hi != MAP_FAILED) munmap(hi, hi_n);
+    }
+};
+
+void* map_fixed(uint64_t addr, uint64_t size) {
+    void* p = mmap(reinterpret_cast<void*>(addr), size,
+                   PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+                   -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+} // namespace
 
 MemoryRegion make_lazy_ram(uint64_t base, uint64_t size, std::string name) {
     MemoryRegion r{};
     r.base = base; r.size = size; r.type = RegionType::RAM; r.name = std::move(name);
+    // The host does not use the low 16 GB. Mapping the guest there means the
+    // CPU can run title code directly, instead of one interpreted instruction
+    // at a time. The MMIO hole stays unmapped so those accesses still fault.
+    if (base == 0 && size == XBSS_RAM_SIZE) {
+        auto hold = std::make_shared<IdentityHold>();
+        hold->lo_n = XBSS_MMIO_BASE - 0x10000;
+        hold->hi_n = XBSS_RAM_SIZE - 0x100000000ULL;
+        hold->lo = map_fixed(0x10000, hold->lo_n);
+        hold->hi = map_fixed(0x100000000ULL, hold->hi_n);
+        if (hold->lo && hold->hi) {
+            r.identity = true;
+            r.ext = std::shared_ptr<uint8_t>(reinterpret_cast<uint8_t*>(0x10000),
+                                             [hold](uint8_t*) {});
+            std::fprintf(stderr, "  [mem] identity map 16 GB (code runs on the host CPU)\n");
+            return r;
+        }
+    }
     void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) throw std::bad_alloc();
@@ -76,8 +118,32 @@ uint8_t* MemoryMap::sparse_bytes(uint64_t paddr, bool create) const {
     return p;
 }
 
+uint8_t* MemoryMap::dram_fast(uint64_t paddr, uint64_t n) {
+    return const_cast<uint8_t*>(static_cast<const MemoryMap*>(this)->dram_fast(paddr, n));
+}
+
+const uint8_t* MemoryMap::dram_fast(uint64_t paddr, uint64_t n) const {
+    if (!n || paddr + n < paddr) return nullptr;
+    uint64_t end = paddr + n;
+    // Overlays (GPU, HPET, PCIe) live only in [0xE0000000, 0x100000000).
+    bool plain = end <= XBSS_MMIO_BASE
+              || (paddr >= 0x100000000ULL && end <= XBSS_RAM_SIZE);
+    if (!plain || regions_.empty() || regions_[0].base != 0 || !regions_[0].bytes())
+        return nullptr;
+    if (regions_[0].identity) {
+        if (paddr < 0x10000) return nullptr;
+        return reinterpret_cast<const uint8_t*>(paddr);
+    }
+    return regions_[0].bytes() + paddr;
+}
+
 template<typename T>
 T MemoryMap::read_impl(uint64_t paddr) const {
+    if (const uint8_t* p = dram_fast(paddr, sizeof(T))) {
+        T val;
+        std::memcpy(&val, p, sizeof(T));
+        return val;
+    }
     auto opt = find_region(paddr);
     if (!opt) {
         if (uint8_t* p = sparse_bytes(paddr, false)) {
@@ -107,6 +173,10 @@ T MemoryMap::read_impl(uint64_t paddr) const {
 
 template<typename T>
 void MemoryMap::write_impl(uint64_t paddr, T val) {
+    if (uint8_t* p = dram_fast(paddr, sizeof(T))) {
+        std::memcpy(p, &val, sizeof(T));
+        return;
+    }
     auto opt = find_region(paddr);
     if (!opt) {
         if (uint8_t* p = sparse_bytes(paddr, true)) {
@@ -140,6 +210,37 @@ void MemoryMap::write16(uint64_t a, uint16_t v) { write_impl(a, v); }
 void MemoryMap::write32(uint64_t a, uint32_t v) { write_impl(a, v); }
 void MemoryMap::write64(uint64_t a, uint64_t v) { write_impl(a, v); }
 
+void MemoryMap::visit_resident_dram(const std::function<void(uint64_t, const uint8_t*, uint64_t)>& fn) const {
+    constexpr uint64_t page = 4096;
+    auto walk = [&](uint64_t base, const uint8_t* bytes, uint64_t size) {
+        if (!bytes || size < page) return;
+        const size_t pages = static_cast<size_t>(size / page);
+        std::vector<unsigned char> resident(pages);
+        if (mincore(const_cast<uint8_t*>(bytes), size, resident.data()) != 0) return;
+        size_t run = 0;
+        bool in = false;
+        for (size_t i = 0; i < pages; ++i) {
+            bool on = (resident[i] & 1) != 0;
+            if (on && !in) { run = i; in = true; }
+            if (!on && in) {
+                fn(base + run * page, bytes + run * page, (i - run) * page);
+                in = false;
+            }
+        }
+        if (in) fn(base + run * page, bytes + run * page, (pages - run) * page);
+    };
+    for (const auto& r : regions_) {
+        if (r.name != "DRAM" || !r.bytes() || r.size == 0) continue;
+        if (r.identity) {
+            walk(0x10000, reinterpret_cast<const uint8_t*>(0x10000), XBSS_MMIO_BASE - 0x10000);
+            walk(0x100000000ULL, reinterpret_cast<const uint8_t*>(0x100000000ULL),
+                 XBSS_RAM_SIZE - 0x100000000ULL);
+            continue;
+        }
+        walk(r.base, r.bytes(), r.size);
+    }
+}
+
 void MemoryMap::visit_extra_ram(const std::function<void(uint64_t, const uint8_t*, uint64_t)>& fn) const {
     for (const auto& r : regions_) {
         if (r.name == "DRAM" || r.type == RegionType::MMIO || !r.bytes()) continue;
@@ -150,6 +251,7 @@ void MemoryMap::visit_extra_ram(const std::function<void(uint64_t, const uint8_t
 }
 
 uint8_t* MemoryMap::raw_ptr(uint64_t paddr, uint64_t size) {
+    if (uint8_t* p = dram_fast(paddr, size)) return p;
     auto opt = find_region(paddr);
     if (!opt) {
         if (size > kSparsePage) return nullptr;

@@ -239,6 +239,11 @@ bool XboxLauncher::step_run() {
     emu::cpu::CPU          cpu;
 
     // Wire up CPU ↔ memory
+    if (mem.identity()) cpu.set_identity(emu::memory::XBSS_RAM_SIZE);
+    else cpu.set_dram(mem.dram_base(), mem.dram_bytes());
+    cpu.set_mem_raw([&](uint64_t addr, uint64_t n) -> uint8_t* {
+        return mem.raw_ptr(addr, n);
+    });
     cpu.set_mem_read([&](uint64_t addr, int sz) -> uint64_t {
         switch (sz) {
             case 1: return mem.read8(addr);

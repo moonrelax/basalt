@@ -1,8 +1,11 @@
 #include "kernel/scheduler.h"
+#include "host/guest_window.h"
 #include "cpu/mnemonic_names.h"
+#include "cpu/native_run.h"
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
+#include <cstring>
 #include <vector>
 
 
@@ -21,6 +24,181 @@ static std::vector<uint64_t> probe_list() {
 static const std::vector<uint64_t> g_probes = probe_list();
 // SIGTERM (e.g. from `timeout`) stops the scheduler cleanly so the summary shows where threads spin
 static volatile std::sig_atomic_t g_stop = 0;
+
+// The title's CRT lives behind jmp stubs in the exe. Running those on the host
+// turns a multi-megabyte copy or a byte-by-byte search into one call.
+static bool crt_fast(emu::memory::MemoryMap& mem, emu::cpu::Registers& r) {
+    constexpr uint64_t kBase = 0x140000000ULL;
+    uint64_t rva = r.rip - kBase;
+    bool stub = rva >= 0x5f40540 && rva <= 0x5f407f0 && ((rva & 0xf) == 0);
+    bool scan = rva == 0x4e4ccc0;
+    // DirectStorage wait. EnqueueRequest already copied the bytes, but the
+    // title spins while a status method stays 0. Once Submit has set the
+    // flag at +0x78, the wait is over.
+    if (rva == 0x4f65820) {
+        if (mem.read8(r.rdx + 0x78) != 1) return false;
+        r.rax = 1;
+        r.rip = mem.read64(r.rsp);
+        r.rsp += 8;
+        return true;
+    }
+    if (!stub && !scan) return false;
+
+    auto ret = [&](uint64_t rax) {
+        r.rax = rax;
+        r.rip = mem.read64(r.rsp);
+        r.rsp += 8;
+    };
+    auto span = [&](uint64_t addr, uint64_t n) -> uint8_t* {
+        if (n > (256ULL << 20)) return nullptr;
+        return mem.raw_ptr(addr, n ? n : 1);
+    };
+    auto slen = [&](uint64_t addr) -> uint64_t {
+        uint64_t n = 0;
+        while (n < (16ULL << 20)) {
+            uint8_t* p = span(addr + n, 4096);
+            if (!p) return ~0ULL;
+            for (uint32_t i = 0; i < 4096; ++i) {
+                if (!p[i]) return n + i;
+            }
+            n += 4096;
+        }
+        return n;
+    };
+
+    if (scan) {
+        uint64_t n = r.r8;
+        if (n > (1ULL << 20)) return false;
+        uint64_t hs = slen(r.rcx);
+        uint64_t ns = slen(r.rdx);
+        if (hs == ~0ULL || ns == ~0ULL) return false;
+        uint8_t* h = span(r.rcx, hs + 1);
+        uint8_t* nd = span(r.rdx, (n > ns ? n : ns) + 1);
+        if (!h || !nd) return false;
+        uint64_t found = 0;
+        if (hs && n) {
+            const char* p = reinterpret_cast<char*>(h);
+            const char* end = p + hs;
+            while (p < end) {
+                const void* hit = std::memchr(p, nd[0], static_cast<size_t>(end - p));
+                if (!hit) break;
+                uint64_t i = static_cast<const uint8_t*>(hit) - h;
+                if (std::strncmp(reinterpret_cast<char*>(h + i),
+                                 reinterpret_cast<char*>(nd), n) == 0) {
+                    found = r.rcx + i;
+                    break;
+                }
+                if (!h[i + 1]) break;
+                p = reinterpret_cast<const char*>(hit) + 1;
+            }
+        }
+        ret(found);
+        return true;
+    }
+
+    switch (rva) {
+    case 0x5f40540: { // memchr
+        uint8_t* p = span(r.rcx, r.r8);
+        if (!p) return false;
+        void* f = std::memchr(p, static_cast<int>(r.rdx & 0xff), r.r8);
+        ret(f ? r.rcx + (static_cast<uint8_t*>(f) - p) : 0);
+        return true;
+    }
+    case 0x5f40550: { // memcmp
+        uint8_t* a = span(r.rcx, r.r8);
+        uint8_t* b = span(r.rdx, r.r8);
+        if (!a || !b) return false;
+        int d = std::memcmp(a, b, r.r8);
+        ret(static_cast<uint64_t>(static_cast<int64_t>(d)));
+        return true;
+    }
+    case 0x5f40560: // memcpy
+    case 0x5f40570: { // memmove
+        uint8_t* d = span(r.rcx, r.r8);
+        uint8_t* s = span(r.rdx, r.r8);
+        if (!d || !s) return false;
+        std::memmove(d, s, r.r8);
+        ret(r.rcx);
+        return true;
+    }
+    case 0x5f40580: { // memset
+        uint8_t* d = span(r.rcx, r.r8);
+        if (!d) return false;
+        std::memset(d, static_cast<int>(r.rdx & 0xff), r.r8);
+        ret(r.rcx);
+        return true;
+    }
+    case 0x5f40590: { // strchr
+        uint64_t n = slen(r.rcx);
+        if (n == ~0ULL) return false;
+        uint8_t* p = span(r.rcx, n + 1);
+        if (!p) return false;
+        void* f = std::strchr(reinterpret_cast<char*>(p), static_cast<int>(r.rdx & 0xff));
+        ret(f ? r.rcx + (static_cast<uint8_t*>(f) - p) : 0);
+        return true;
+    }
+    case 0x5f405a0: { // strrchr
+        uint64_t n = slen(r.rcx);
+        if (n == ~0ULL) return false;
+        uint8_t* p = span(r.rcx, n + 1);
+        if (!p) return false;
+        void* f = std::strrchr(reinterpret_cast<char*>(p), static_cast<int>(r.rdx & 0xff));
+        ret(f ? r.rcx + (static_cast<uint8_t*>(f) - p) : 0);
+        return true;
+    }
+    case 0x5f405b0: { // strstr
+        uint64_t n = slen(r.rcx);
+        uint64_t m = slen(r.rdx);
+        if (n == ~0ULL || m == ~0ULL) return false;
+        uint8_t* h = span(r.rcx, n + 1);
+        uint8_t* nd = span(r.rdx, m + 1);
+        if (!h || !nd) return false;
+        char* f = std::strstr(reinterpret_cast<char*>(h), reinterpret_cast<char*>(nd));
+        ret(f ? r.rcx + (reinterpret_cast<uint8_t*>(f) - h) : 0);
+        return true;
+    }
+    case 0x5f407c0: { // strcat
+        uint64_t n = slen(r.rcx);
+        uint64_t m = slen(r.rdx);
+        if (n == ~0ULL || m == ~0ULL) return false;
+        uint8_t* d = span(r.rcx, n + m + 1);
+        uint8_t* s = span(r.rdx, m + 1);
+        if (!d || !s) return false;
+        std::memcpy(d + n, s, m + 1);
+        ret(r.rcx);
+        return true;
+    }
+    case 0x5f407d0: { // strcmp
+        uint64_t n = slen(r.rcx);
+        uint64_t m = slen(r.rdx);
+        if (n == ~0ULL || m == ~0ULL) return false;
+        uint8_t* a = span(r.rcx, n + 1);
+        uint8_t* b = span(r.rdx, m + 1);
+        if (!a || !b) return false;
+        int d = std::strcmp(reinterpret_cast<char*>(a), reinterpret_cast<char*>(b));
+        ret(static_cast<uint64_t>(static_cast<int64_t>(d)));
+        return true;
+    }
+    case 0x5f407e0: { // strcpy
+        uint64_t m = slen(r.rdx);
+        if (m == ~0ULL) return false;
+        uint8_t* d = span(r.rcx, m + 1);
+        uint8_t* s = span(r.rdx, m + 1);
+        if (!d || !s) return false;
+        std::memcpy(d, s, m + 1);
+        ret(r.rcx);
+        return true;
+    }
+    case 0x5f407f0: { // strlen
+        uint64_t n = slen(r.rcx);
+        if (n == ~0ULL) return false;
+        ret(n);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
 
 namespace emu::kernel {
 
@@ -126,8 +304,17 @@ void Scheduler::ingest_pending() {
 }
 
 void Scheduler::wake_waiting_threads() {
+    uint64_t now = runner_.guest_qpc();
     for (auto& t : threads_) {
         if (t.state != ThreadState::Waiting) continue;
+        if (t.sleep_until) {
+            if (now >= t.sleep_until) {
+                t.sleep_until = 0;
+                t.regs.rax = 0;
+                t.state = ThreadState::Ready;
+            }
+            continue;
+        }
         if (t.wait_handles.empty()) {
             t.regs.rax = 0;
             t.state = ThreadState::Ready;
@@ -144,7 +331,7 @@ void Scheduler::wake_waiting_threads() {
             if (all_sig) {
                 for (uint64_t h : t.wait_handles) runner_.try_acquire_event(h);
                 t.wait_handles.clear();
-                t.regs.rax = 0; // WAIT_OBJECT_0
+                t.regs.rax = t.wake_rax;
                 t.state = ThreadState::Ready;
             }
         } else {
@@ -152,7 +339,7 @@ void Scheduler::wake_waiting_threads() {
                 if (runner_.is_event_signaled(t.wait_handles[i])) {
                     runner_.try_acquire_event(t.wait_handles[i]);
                     t.wait_handles.clear();
-                    t.regs.rax = static_cast<uint64_t>(i); // WAIT_OBJECT_0 + i
+                    t.regs.rax = t.wake_rax ? t.wake_rax : static_cast<uint64_t>(i);
                     t.state = ThreadState::Ready;
                     break;
                 }
@@ -212,10 +399,15 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
     runner_.set_scheduler_mode(true);
     std::signal(SIGTERM, [](int) { g_stop = 1; });
     ingest_pending();
+    if (cpu_.identity()) {
+        runner_.loader().plant_traps(mem_);
+        std::fprintf(stderr, "  [cpu] title code runs on the host CPU\n");
+    }
 
     size_t cur = threads_.empty() ? 0 : threads_.size() - 1;
 
-    while (total_insns_ < total_budget && !g_stop) {
+    while (total_insns_ < total_budget && !g_stop &&
+           !emu::host::GuestWindow::instance().closed()) {
         ingest_pending();
         wake_waiting_threads();
 
@@ -232,6 +424,14 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
         }
 
         if (next == threads_.size()) {
+            uint64_t soon = ~0ULL;
+            for (const auto& t : threads_)
+                if (t.state == ThreadState::Waiting && t.sleep_until && t.sleep_until < soon)
+                    soon = t.sleep_until;
+            if (soon != ~0ULL) {
+                runner_.advance_qpc_to(soon);
+                continue;
+            }
             bool any_waiting = false;
             for (const auto& t : threads_)
                 if (t.state == ThreadState::Waiting) any_waiting = true;
@@ -277,6 +477,256 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                 break;
             }
 
+            {
+                uint64_t ibase = 0, iend = 0;
+                if (runner_.image_span(r.rip, ibase, iend)) {
+                    if (cpu_.identity() && r.rip >= 0x10000 && r.rip < 0x400000000ULL) {
+                        static int entry_logs = 0;
+                        if (entry_logs < 4) {
+                            ++entry_logs;
+                            uint8_t b[8]{};
+                            for (int i = 0; i < 8; ++i) b[i] = mem_.read8(r.rip + i);
+                            std::fprintf(stderr,
+                                         "  [native] enter rip=%s bytes=%02x %02x %02x %02x %02x %02x %02x %02x fs=%llx gs=%llx\n",
+                                         runner_.where(r.rip).c_str(),
+                                         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                                         static_cast<unsigned long long>(r.msr_fs_base),
+                                         static_cast<unsigned long long>(r.msr_gs_base));
+                            std::fprintf(stderr, "  [native] rsp=%llx rflags=%llx\n",
+                                         static_cast<unsigned long long>(r.rsp),
+                                         static_cast<unsigned long long>(r.rflags));
+                            std::fflush(stderr);
+                        }
+                        // clwb over a multi-gigabyte range. The flush changes nothing.
+                        if (r.rip >= 0x144ecc83bULL && r.rip < 0x144ecc858ULL &&
+                            static_cast<uint32_t>(r.rdx) == 0) {
+                            r.rip = 0x144ecc858ULL;
+                            continue;
+                        }
+                        // div ecx with ecx == 0. The title hits this and the fault
+                        // would otherwise be retried for the rest of the run.
+                        if (mem_.read8(r.rip) == 0xF7 && mem_.read8(r.rip + 1) == 0xF1 &&
+                            static_cast<uint32_t>(r.rcx) == 0) {
+                            static int divs = 0;
+                            if (divs < 4) {
+                                ++divs;
+                                std::fprintf(stderr, "  [native] skip div0 at %s\n",
+                                             runner_.where(r.rip).c_str());
+                            }
+                            r.rax = 0;
+                            r.rdx = 0;
+                            r.rip += 2;
+                            continue;
+                        }
+                        // call [rax+0x50] where the slot holds text, not code.
+                        // The next instruction requires eax == ebx.
+                        if (r.rip == 0x14086f9beULL) {
+                            uint64_t tgt = mem_.read64(r.rax + 0x50);
+                            if (tgt < 0x10000ULL || tgt >= 0x400000000ULL) {
+                                static int bad_calls = 0;
+                                if (bad_calls < 4) {
+                                    ++bad_calls;
+                                    std::fprintf(stderr,
+                                                 "  [native] skip call [rax+50]=0x%llx at %s\n",
+                                                 static_cast<unsigned long long>(tgt),
+                                                 runner_.where(r.rip).c_str());
+                                }
+                                r.rax = r.rbx;
+                                r.rip += 3;
+                                continue;
+                            }
+                        }
+                        // memset(0) of a fresh allocation. The pages are already zero,
+                        // and filling them would pin gigabytes of RAM for nothing.
+                        if (mem_.read8(r.rip) == 0xF3 && mem_.read8(r.rip + 1) == 0xAA &&
+                            (r.rax & 0xff) == 0 && (r.rflags & 0x400) == 0 &&
+                            r.rcx > (1u << 20)) {
+                            static int skip_logs = 0;
+                            if (skip_logs < 8) {
+                                ++skip_logs;
+                                std::fprintf(stderr, "  [native] skip zero-fill %llu bytes at %s\n",
+                                             static_cast<unsigned long long>(r.rcx),
+                                             runner_.where(r.rdi).c_str());
+                            }
+                            r.rdi += r.rcx;
+                            r.rcx = 0;
+                            r.rip += 2;
+                            continue;
+                        }
+                        uint32_t c0 = 0, c1 = 0;
+                        asm volatile("rdtsc" : "=a"(c0), "=d"(c1));
+                        auto stop = native_slice(r);
+                        uint32_t d0 = 0, d1 = 0;
+                        asm volatile("rdtsc" : "=a"(d0), "=d"(d1));
+                        (void)c1;
+                        (void)d1;
+                        uint64_t n = (static_cast<uint64_t>(d0 - c0)) / 4;
+                        if (n < 1) n = 1;
+                        if (n > 20'000'000) n = 20'000'000;
+                        // A trap is one guest instruction plus the host signal.
+                        // Counting the signal time made a Sleep loop burn the budget.
+                        if (stop == cpu::NativeStop::Trap && n > 64) n = 64;
+                        uint64_t before = total_insns_;
+                        slice_insns += n;
+                        t.insns += n;
+                        total_insns_ += n;
+                        runner_.add_insn_count(n);
+                        if ((before >> 24) != (total_insns_ >> 24)) {
+                            std::fprintf(stderr, "  [progress] insns=%llu rip=%s\n",
+                                         static_cast<unsigned long long>(total_insns_),
+                                         runner_.where(r.rip).c_str());
+                            std::fflush(stderr);
+                        }
+                        // A multi-gigabyte rep stos commits pages until the kernel
+                        // kills the process. Stop the string op once RAM is tight.
+                        if ((r.rip & 1) == 0) {
+                            static int rss_checks = 0;
+                            if ((++rss_checks & 31) == 0) {
+                                unsigned long resident = 0;
+                                if (FILE* f = std::fopen("/proc/self/statm", "r")) {
+                                    if (std::fscanf(f, "%*u %lu", &resident) != 1) resident = 0;
+                                    std::fclose(f);
+                                }
+                                if (resident > (6ull << 30) / 4096 &&
+                                    mem_.read8(r.rip) == 0xF3) {
+                                    std::fprintf(stderr, "  [native] stopped a string fill at %s (ram)\n",
+                                                 runner_.where(r.rip).c_str());
+                                    r.rcx = 0;
+                                    r.rip += 2;
+                                }
+                            }
+                        }
+                        // A zeroed control-byte table has no empty marker, so this
+                        // probe walks the same groups forever. Return "not found".
+                        if ((r.rip >= 0x14292d610ULL && r.rip < 0x14292d670ULL) ||
+                            (r.rip >= 0x14292db11ULL && r.rip < 0x14292db60ULL)) {
+                            static uint64_t probes = 0;
+                            probes += n;
+                            if (probes > 500000000ULL) {
+                                std::fprintf(stderr, "  [native] hash probe did not end, leaving it\n");
+                                r.rip = 0x14292dc46ULL;
+                                probes = 0;
+                            }
+                        }
+                        if (stop == cpu::NativeStop::Trap && r.rip &&
+                            runner_.loader().thunk_at(r.rip - 1))
+                            r.rip -= 1;
+                        if (stop == cpu::NativeStop::Syscall) {
+                            static int sys_logs = 0;
+                            if (sys_logs < 16) {
+                                ++sys_logs;
+                                std::fprintf(stderr, "  [native] syscall rax=0x%llx rip=%s lstar=0x%llx\n",
+                                             static_cast<unsigned long long>(r.rax),
+                                             runner_.where(r.rip).c_str(),
+                                             static_cast<unsigned long long>(r.msr_lstar));
+                            }
+                            if (r.msr_lstar) {
+                                r.rcx = r.rip;
+                                r.r11 = r.rflags;
+                                r.rip = r.msr_lstar;
+                            } else {
+                                r.rax = 0;
+                            }
+                            break;
+                        }
+                        if (stop == cpu::NativeStop::Fault) {
+                            uint8_t op = mem_.read8(r.rip);
+                            if ((op == 0xCC || op == 0xF4) && runner_.loader().thunk_at(r.rip)) {
+                                stop = cpu::NativeStop::Trap;
+                            } else {
+                            static int fault_logs = 0;
+                            if (fault_logs < 24) {
+                                ++fault_logs;
+                                uint8_t b[8]{};
+                                for (int i = 0; i < 8; ++i) b[i] = mem_.read8(r.rip + i);
+                                std::fprintf(stderr,
+                                             "  [native] fault rip=%s bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                             runner_.where(r.rip).c_str(),
+                                             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+                            }
+                            uint8_t op0 = mem_.read8(r.rip);
+                            uint8_t op1 = mem_.read8(r.rip + 1);
+                            if (op0 == 0xF3 && (op1 == 0xAA || op1 == 0xAB)) {
+                                uint64_t n = r.rcx > 65536 ? 65536 : r.rcx;
+                                int sz = op1 == 0xAA ? 1 : 4;
+                                for (uint64_t i = 0; i < n; ++i) {
+                                    if (sz == 1) mem_.write8(r.rdi + i, static_cast<uint8_t>(r.rax));
+                                    else mem_.write32(r.rdi + i * 4, static_cast<uint32_t>(r.rax));
+                                }
+                                r.rdi += n * static_cast<uint64_t>(sz);
+                                r.rcx -= n;
+                                if (r.rcx == 0) r.rip += 2;
+                            } else {
+                            cpu_.step();
+                            ++slice_insns; ++t.insns; ++total_insns_;
+                            runner_.add_insn_count(1);
+                            if (cpu_.fault()) {
+                                t.state = ThreadState::Faulted;
+                                t.stop_reason = "cpu-fault";
+                                report_thread_fault(t);
+                                break;
+                            }
+                            }
+                            }
+                        }
+                        if (!runner_.loader().thunk_at(r.rip)) break;
+                    } else {
+                    int burst = 8192;
+                    while (burst-- && slice_insns < quantum && total_insns_ < total_budget) {
+                        if (r.rip < ibase || r.rip >= iend) break;
+                        if (crt_fast(mem_, r)) {
+                            ++slice_insns;
+                            ++t.insns;
+                            ++total_insns_;
+                            runner_.add_insn_count(1);
+                            continue;
+                        }
+                        if ((total_insns_ & 0xFFFFFFULL) == 0) {
+                            std::fprintf(stderr, "  [progress] insns=%llu rip=%s\n",
+                                         static_cast<unsigned long long>(total_insns_),
+                                         runner_.where(r.rip).c_str());
+                        }
+                        // Bounded copy the title calls as exe+0x5352510. Doing it
+                        // here keeps the archive walk on the host instead of one
+                        // interpreted byte at a time.
+                        if (r.rip == 0x145352510ULL) {
+                            uint64_t lim = r.r8 ? r.r8 - 1 : 0;
+                            if (lim > (1u << 20)) lim = 1u << 20;
+                            uint8_t* dst = mem_.raw_ptr(r.rcx, lim + 1);
+                            uint8_t* src = mem_.raw_ptr(r.rdx, lim + 1);
+                            if (dst && src) {
+                                uint64_t i = 0;
+                                for (; i < lim && src[i]; ++i) dst[i] = src[i];
+                                dst[i] = 0;
+                                r.rax = r.rcx;
+                                r.rip = mem_.read64(r.rsp);
+                                r.rsp += 8;
+                                ++slice_insns;
+                                ++t.insns;
+                                ++total_insns_;
+                                runner_.add_insn_count(1);
+                                continue;
+                            }
+                        }
+                        cpu_.step();
+                        ++slice_insns;
+                        ++t.insns;
+                        ++total_insns_;
+                        runner_.add_insn_count(1);
+                        if (cpu_.fault()) {
+                            t.state       = ThreadState::Faulted;
+                            t.stop_reason = "cpu-fault";
+                            report_thread_fault(t);
+                            burst = 0;
+                            break;
+                        }
+                    }
+                    if (t.state == ThreadState::Faulted) break;
+                    continue;
+                    }
+                }
+            }
+
             if (const Thunk* tk = runner_.loader().thunk_at(r.rip)) {
                 uint64_t before = runner_.insn_count();
                 runner_.handle_thunk(*tk);
@@ -297,6 +747,40 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
 
                 WaitRequest wr = runner_.take_wait_request();
                 if (wr.active) {
+                    t.wake_rax = wr.wake_rax;
+                    if (wr.sleep_until) {
+                        t.sleep_until = wr.sleep_until;
+                        t.wait_handles.clear();
+                        t.state = ThreadState::Waiting;
+                        break;
+                    }
+                    if (r.rip == 0x140056a0dULL) {
+                        static int barrier_logs = 0;
+                        static int main_dumps = 0;
+                        if (barrier_logs < 8) {
+                            ++barrier_logs;
+                            std::fprintf(stderr,
+                                         "    [sync] barrier wait tid=%u h=0x%llx remaining=%u\n",
+                                         t.tid,
+                                         wr.handles.empty() ? 0ull
+                                                            : static_cast<unsigned long long>(wr.handles[0]),
+                                         static_cast<unsigned>(r.rsi));
+                        }
+                        if (t.tid == 8 && main_dumps < 1) {
+                            ++main_dumps;
+                            std::fprintf(stderr,
+                                         "    [sync] main barrier h=0x%llx remaining=%u\n",
+                                         wr.handles.empty() ? 0ull
+                                                            : static_cast<unsigned long long>(wr.handles[0]),
+                                         static_cast<unsigned>(r.rsi));
+                            for (int i = 0; i < 48; ++i) {
+                                uint64_t q = mem_.read64(r.rsp + static_cast<uint64_t>(i) * 8);
+                                if (q >= 0x140000000ULL && q < 0x150000000ULL)
+                                    std::fprintf(stderr, "      rsp+0x%02x %s\n",
+                                                 i * 8, runner_.where(q).c_str());
+                            }
+                        }
+                    }
                     t.state        = ThreadState::Waiting;
                     t.wait_all     = wr.wait_all;
                     t.wait_handles = std::move(wr.handles);
@@ -312,8 +796,11 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
             if (r.rip == 0) {
                 // call *reg with a null pointer. Pop the return address and
                 // continue with rax=0 instead of killing the thread.
-                r.rax = 0;
-                r.rip = mem_.read64(r.rsp);
+                // The loader polls a completion method that was never filled in.
+                // The file bytes are already in the destination, so that poll is done.
+                uint64_t ret = mem_.read64(r.rsp);
+                r.rax = (ret - 0x140000000ULL == 0x4f6584a) ? 1 : 0;
+                r.rip = ret;
                 r.rsp += 8;
                 static int null_calls = 0;
                 if (null_calls < 8) {
@@ -403,6 +890,7 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
 
         // Context switch OUT via cpu_.regs().
         t.regs = cpu_.regs();
+        emu::host::GuestWindow::instance().pump();
     }
 
     if (total_insns_ >= total_budget) {
@@ -448,6 +936,63 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
             }
         }
     });
+
+    uint64_t dram_pages = 0, dram_hot = 0;
+    int sigs = 0;
+    mem_.visit_resident_dram([&](uint64_t base, const uint8_t* p, uint64_t n) {
+        dram_pages += n / 4096;
+        for (uint64_t off = 0; off + 4096 <= n; off += 4096) {
+            for (int s = 0; s < 8; ++s) {
+                uint32_t w = 0;
+                std::memcpy(&w, p + off + static_cast<uint64_t>(s) * 512, 4);
+                if (w) { ++dram_hot; break; }
+            }
+        }
+        for (uint64_t i = 0; i + 32 < n && sigs < 8; ++i) {
+            bool png = p[i] == 0x89 && p[i + 1] == 'P' && p[i + 2] == 'N' && p[i + 3] == 'G';
+            bool bmp = p[i] == 'B' && p[i + 1] == 'M';
+            bool dds = p[i] == 'D' && p[i + 1] == 'D' && p[i + 2] == 'S' && p[i + 3] == ' ';
+            if (!png && !bmp && !dds) continue;
+            ++sigs;
+            std::fprintf(stderr, "  [img] guest 0x%llx %s\n",
+                         static_cast<unsigned long long>(base + i),
+                         png ? "PNG" : bmp ? "BMP" : "DDS");
+            if (!bmp || i + 54 > n) continue;
+            uint32_t pix_off = 0, hdr = 0, width = 0;
+            int32_t height = 0;
+            uint16_t bpp = 0;
+            std::memcpy(&pix_off, p + i + 10, 4);
+            std::memcpy(&hdr, p + i + 14, 4);
+            std::memcpy(&width, p + i + 18, 4);
+            std::memcpy(&height, p + i + 22, 4);
+            std::memcpy(&bpp, p + i + 28, 2);
+            if (hdr < 40 || width < 8 || width > 3840 || height == 0 ||
+                (bpp != 24 && bpp != 32))
+                continue;
+            uint32_t ah = static_cast<uint32_t>(height < 0 ? -height : height);
+            if (ah > 2160) continue;
+            uint64_t row = (static_cast<uint64_t>(width) * bpp / 8 + 3) & ~3ull;
+            if (i + pix_off + row * ah > n) continue;
+            std::vector<uint8_t> rgba(static_cast<size_t>(width) * ah * 4);
+            for (uint32_t y = 0; y < ah; ++y) {
+                uint32_t src_y = height > 0 ? ah - 1 - y : y;
+                const uint8_t* rowp = p + i + pix_off + static_cast<uint64_t>(src_y) * row;
+                for (uint32_t x = 0; x < width; ++x) {
+                    size_t d = (static_cast<size_t>(y) * width + x) * 4;
+                    rgba[d + 0] = rowp[x * (bpp / 8) + 2];
+                    rgba[d + 1] = rowp[x * (bpp / 8) + 1];
+                    rgba[d + 2] = rowp[x * (bpp / 8) + 0];
+                    rgba[d + 3] = 255;
+                }
+            }
+            emu::host::GuestWindow::instance().show_rgba(rgba.data(),
+                                                         static_cast<int>(width),
+                                                         static_cast<int>(ah));
+        }
+    });
+    std::fprintf(stderr, "  [mem] DRAM resident=%llu pages hot=%llu signatures=%d\n",
+                 static_cast<unsigned long long>(dram_pages),
+                 static_cast<unsigned long long>(dram_hot), sigs);
 }
 
 } // namespace emu::kernel

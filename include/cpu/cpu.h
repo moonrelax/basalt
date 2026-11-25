@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <array>
 #include <functional>
+#include <memory>
 #include "cpu/decoder.h"
 
 namespace emu::cpu {
@@ -84,6 +85,7 @@ struct Registers {
 
 using MemReadFn  = std::function<uint64_t(uint64_t addr, int size)>;
 using MemWriteFn = std::function<void(uint64_t addr, uint64_t val, int size)>;
+using MemRawFn   = std::function<uint8_t*(uint64_t addr, uint64_t size)>;
 
 class CPU {
 public:
@@ -95,6 +97,38 @@ public:
 
     void set_mem_read (MemReadFn  fn) { mem_read_  = std::move(fn); }
     void set_mem_write(MemWriteFn fn) { mem_write_ = std::move(fn); }
+    void set_mem_raw  (MemRawFn   fn) { mem_raw_   = std::move(fn); }
+    // Flat guest RAM. Hits here skip the slow callback.
+    void set_dram(uint8_t* base, uint64_t bytes) { dram_ = base; dram_end_ = bytes; identity_ = false; }
+    // Guest physical address == host address. Used when DRAM is mapped there.
+    void set_identity(uint64_t bytes) { identity_ = true; dram_ = nullptr; dram_end_ = bytes; }
+    bool identity() const { return identity_; }
+
+    bool plain_dram(uint64_t addr, uint64_t n) const {
+        uint64_t end = addr + n;
+        if (!n || end < addr || end > dram_end_) return false;
+        if (!(end <= 0xE0000000ULL || addr >= 0x100000000ULL)) return false;
+        if (identity_) return addr >= 0x10000;
+        return dram_ != nullptr;
+    }
+    uint8_t* host_at(uint64_t addr) {
+        return identity_ ? reinterpret_cast<uint8_t*>(addr) : dram_ + addr;
+    }
+    uint64_t ld(uint64_t addr, int size) {
+        if (plain_dram(addr, static_cast<unsigned>(size))) {
+            uint64_t v = 0;
+            __builtin_memcpy(&v, host_at(addr), static_cast<unsigned>(size));
+            return v;
+        }
+        return mem_read_ ? mem_read_(addr, size) : 0;
+    }
+    void st(uint64_t addr, uint64_t val, int size) {
+        if (plain_dram(addr, static_cast<unsigned>(size))) {
+            __builtin_memcpy(host_at(addr), &val, static_cast<unsigned>(size));
+            return;
+        }
+        if (mem_write_) mem_write_(addr, val, size);
+    }
 
     void raise_interrupt(uint8_t vector);
     void assert_nmi();
@@ -123,6 +157,21 @@ private:
 
     MemReadFn  mem_read_;
     MemWriteFn mem_write_;
+    MemRawFn   mem_raw_;
+    uint8_t*   dram_ = nullptr;
+    uint64_t   dram_end_ = 0;
+    bool       identity_ = false;
+    uint8_t*   raw_span(uint64_t addr, uint64_t n) {
+        if (plain_dram(addr, n)) return host_at(addr);
+        return mem_raw_ ? mem_raw_(addr, n) : nullptr;
+    }
+
+    struct ICacheSlot {
+        uint64_t    rip = ~uint64_t{0};
+        DecodedInsn insn{};
+    };
+    static constexpr uint32_t kICache = 1u << 18;
+    std::unique_ptr<ICacheSlot[]> icache_;
 
     uint8_t  fetch8();
     uint16_t fetch16();

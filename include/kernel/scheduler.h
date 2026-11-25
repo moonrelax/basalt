@@ -27,6 +27,8 @@ struct GuestThread {
     cpu::Registers        regs{};
     ThreadState           state      = ThreadState::Ready;
     bool                  wait_all   = false;
+    uint64_t              wake_rax   = 0;
+    uint64_t              sleep_until = 0; // guest QPC tick; 0 means not asleep
     std::vector<uint64_t> wait_handles;
     uint64_t              insns      = 0;
     uint64_t              slices     = 0;

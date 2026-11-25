@@ -16,16 +16,7 @@ static inline uint64_t size_mask(int sz) {
 }
 
 static inline uint64_t& gpr64(Registers& r, int idx) {
-    switch (idx & 15) {
-        case  0: return r.rax; case  1: return r.rcx;
-        case  2: return r.rdx; case  3: return r.rbx;
-        case  4: return r.rsp; case  5: return r.rbp;
-        case  6: return r.rsi; case  7: return r.rdi;
-        case  8: return r.r8;  case  9: return r.r9;
-        case 10: return r.r10; case 11: return r.r11;
-        case 12: return r.r12; case 13: return r.r13;
-        case 14: return r.r14; default: return r.r15;
-    }
+    return (&r.rax)[idx & 15];
 }
 
 static inline uint64_t read_gpr(const Registers& r, int idx, int sz) {
@@ -138,13 +129,13 @@ uint64_t CPU::read_operand(const Operand& op) {
             return read_gpr(regs_, op.reg, op.size);
         case OperandType::Mem: {
             uint64_t a = eff_addr(op);
-            return mem_read_(a, op.size) & size_mask(op.size);
+            return ld(a, op.size) & size_mask(op.size);
         }
         case OperandType::Imm:
         case OperandType::Rel:
             return static_cast<uint64_t>(op.imm);
         case OperandType::Moffs:
-            return mem_read_(static_cast<uint64_t>(op.imm), op.size) & size_mask(op.size);
+            return ld(static_cast<uint64_t>(op.imm), op.size) & size_mask(op.size);
         default:
             return 0;
     }
@@ -156,10 +147,10 @@ void CPU::write_operand(const Operand& op, uint64_t val) {
             write_gpr(regs_, op.reg, op.size, val);
             break;
         case OperandType::Mem:
-            mem_write_(eff_addr(op), val & size_mask(op.size), op.size);
+            st(eff_addr(op), val & size_mask(op.size), op.size);
             break;
         case OperandType::Moffs:
-            mem_write_(static_cast<uint64_t>(op.imm), val & size_mask(op.size), op.size);
+            st(static_cast<uint64_t>(op.imm), val & size_mask(op.size), op.size);
             break;
         default:
             break;
@@ -168,11 +159,11 @@ void CPU::write_operand(const Operand& op, uint64_t val) {
 
 void CPU::push_val(uint64_t val, int sz) {
     regs_.rsp -= sz;
-    mem_write_(regs_.rsp, val, sz);
+    st(regs_.rsp, val, sz);
 }
 
 uint64_t CPU::pop_val(int sz) {
-    uint64_t v = mem_read_(regs_.rsp, sz);
+    uint64_t v = ld(regs_.rsp, sz);
     regs_.rsp += sz;
     return v;
 }
@@ -183,8 +174,8 @@ XMMRegister CPU::xsrc(const Operand& op) {
     if (op.type == OperandType::Reg) return regs_.ymm[op.reg & 31].lo;
     XMMRegister r{};
     uint64_t a = eff_addr(op);
-    r.q[0] = mem_read_(a, 8);
-    r.q[1] = mem_read_(a + 8, 8);
+    r.q[0] = ld(a, 8);
+    r.q[1] = ld(a + 8, 8);
     return r;
 }
 
@@ -192,26 +183,26 @@ XMMRegister CPU::xsrc_hi(const Operand& op) {
     if (op.type == OperandType::Reg) return regs_.ymm[op.reg & 31].hi;
     XMMRegister r{};
     uint64_t a = eff_addr(op) + 16;
-    r.q[0] = mem_read_(a, 8);
-    r.q[1] = mem_read_(a + 8, 8);
+    r.q[0] = ld(a, 8);
+    r.q[1] = ld(a + 8, 8);
     return r;
 }
 
 float CPU::read_f32(const Operand& op) {
     if (op.type == OperandType::Reg) return regs_.ymm[op.reg & 31].lo.f[0];
-    uint32_t bits = static_cast<uint32_t>(mem_read_(eff_addr(op), 4));
+    uint32_t bits = static_cast<uint32_t>(ld(eff_addr(op), 4));
     return std::bit_cast<float>(bits);
 }
 
 double CPU::read_f64(const Operand& op) {
     if (op.type == OperandType::Reg) return regs_.ymm[op.reg & 31].lo.df[0];
-    uint64_t bits = mem_read_(eff_addr(op), 8);
+    uint64_t bits = ld(eff_addr(op), 8);
     return std::bit_cast<double>(bits);
 }
 
 void CPU::write_xmm_mem(uint64_t addr, const XMMRegister& v) {
-    mem_write_(addr,     v.q[0], 8);
-    mem_write_(addr + 8, v.q[1], 8);
+    st(addr,     v.q[0], 8);
+    st(addr + 8, v.q[1], 8);
 }
 
 static inline int32_t cvtt_f64_to_i32(double v) {
@@ -514,12 +505,12 @@ void CPU::execute(const DecodedInsn& insn) {
 
     case Mnemonic::CMPXCHG8B: {
         uint64_t a = eff_addr(insn.dst);
-        uint32_t mlo = static_cast<uint32_t>(mem_read_(a, 4));
-        uint32_t mhi = static_cast<uint32_t>(mem_read_(a + 4, 4));
+        uint32_t mlo = static_cast<uint32_t>(ld(a, 4));
+        uint32_t mhi = static_cast<uint32_t>(ld(a + 4, 4));
         if (mlo == static_cast<uint32_t>(regs_.rax) && mhi == static_cast<uint32_t>(regs_.rdx)) {
             set_flag(regs_, 6, true);
-            mem_write_(a,     static_cast<uint32_t>(regs_.rbx), 4);
-            mem_write_(a + 4, static_cast<uint32_t>(regs_.rcx), 4);
+            st(a,     static_cast<uint32_t>(regs_.rbx), 4);
+            st(a + 4, static_cast<uint32_t>(regs_.rcx), 4);
         } else {
             set_flag(regs_, 6, false);
             write_gpr(regs_, 0, 4, mlo);
@@ -530,12 +521,12 @@ void CPU::execute(const DecodedInsn& insn) {
 
     case Mnemonic::CMPXCHG16B: {
         uint64_t a = eff_addr(insn.dst);
-        uint64_t mlo = mem_read_(a, 8);
-        uint64_t mhi = mem_read_(a + 8, 8);
+        uint64_t mlo = ld(a, 8);
+        uint64_t mhi = ld(a + 8, 8);
         if (mlo == regs_.rax && mhi == regs_.rdx) {
             set_flag(regs_, 6, true);
-            mem_write_(a,     regs_.rbx, 8);
-            mem_write_(a + 8, regs_.rcx, 8);
+            st(a,     regs_.rbx, 8);
+            st(a + 8, regs_.rcx, 8);
         } else {
             set_flag(regs_, 6, false);
             regs_.rax = mlo;
@@ -964,13 +955,13 @@ void CPU::execute(const DecodedInsn& insn) {
             int64_t elem_off = (sbit >= 0) ? (sbit / elem_bits) : ((sbit - elem_bits + 1) / elem_bits);
             int bit = static_cast<int>(sbit - elem_off * elem_bits);
             uint64_t addr = eff_addr(insn.dst) + static_cast<uint64_t>(elem_off * sz);
-            uint64_t base = mem_read_(addr, sz) & size_mask(sz);
+            uint64_t base = ld(addr, sz) & size_mask(sz);
             set_flag(regs_, 0, (base >> bit) & 1);
             if (insn.mnemonic == Mnemonic::BTS) base |=  (1ULL << bit);
             if (insn.mnemonic == Mnemonic::BTR) base &= ~(1ULL << bit);
             if (insn.mnemonic == Mnemonic::BTC) base ^=  (1ULL << bit);
             if (insn.mnemonic != Mnemonic::BT)
-                mem_write_(addr, base & size_mask(sz), sz);
+                st(addr, base & size_mask(sz), sz);
         } else {
             uint64_t base = read_operand(insn.dst) & size_mask(sz);
             int bit = bit_idx & (sz * 8 - 1);
@@ -1274,8 +1265,20 @@ void CPU::execute(const DecodedInsn& insn) {
     case Mnemonic::MOVS: {
         int step = flag_df(regs_) ? -sz : sz;
         uint64_t reps = insn.prefixes.rep ? regs_.rcx : 1;
+        if (step == sz && reps >= 32) {
+            uint64_t bytes = reps * static_cast<uint64_t>(sz);
+            uint8_t* dst = raw_span(regs_.rdi, bytes);
+            uint8_t* src = raw_span(regs_.rsi, bytes);
+            if (dst && src) {
+                std::memmove(dst, src, bytes);
+                regs_.rsi += bytes;
+                regs_.rdi += bytes;
+                regs_.rcx = 0;
+                break;
+            }
+        }
         while (reps--) {
-            mem_write_(regs_.rdi, mem_read_(regs_.rsi, sz), sz);
+            st(regs_.rdi, ld(regs_.rsi, sz), sz);
             regs_.rsi += step;
             regs_.rdi += step;
         }
@@ -1287,8 +1290,24 @@ void CPU::execute(const DecodedInsn& insn) {
         int step = flag_df(regs_) ? -sz : sz;
         uint64_t acc = read_gpr(regs_, 0, sz);
         uint64_t reps = insn.prefixes.rep ? regs_.rcx : 1;
+        if (step == sz && reps >= 32) {
+            uint64_t bytes = reps * static_cast<uint64_t>(sz);
+            if (uint8_t* dst = raw_span(regs_.rdi, bytes)) {
+                if (acc == 0) {
+                    std::memset(dst, 0, bytes);
+                } else if (sz == 1) {
+                    std::memset(dst, static_cast<int>(acc), bytes);
+                } else {
+                    for (uint64_t i = 0; i < bytes; i += static_cast<uint64_t>(sz))
+                        std::memcpy(dst + i, &acc, static_cast<size_t>(sz));
+                }
+                regs_.rdi += bytes;
+                regs_.rcx = 0;
+                break;
+            }
+        }
         while (reps--) {
-            mem_write_(regs_.rdi, acc, sz);
+            st(regs_.rdi, acc, sz);
             regs_.rdi += step;
         }
         if (insn.prefixes.rep) regs_.rcx = 0;
@@ -1297,7 +1316,7 @@ void CPU::execute(const DecodedInsn& insn) {
 
     case Mnemonic::LODS: {
         int step = flag_df(regs_) ? -sz : sz;
-        write_gpr(regs_, 0, sz, mem_read_(regs_.rsi, sz));
+        write_gpr(regs_, 0, sz, ld(regs_.rsi, sz));
         regs_.rsi += step;
         break;
     }
@@ -1306,7 +1325,7 @@ void CPU::execute(const DecodedInsn& insn) {
         int step = flag_df(regs_) ? -sz : sz;
         uint64_t acc = read_gpr(regs_, 0, sz);
         auto do_one = [&]() {
-            uint64_t mem = mem_read_(regs_.rdi, sz);
+            uint64_t mem = ld(regs_.rdi, sz);
             flags_sub(regs_, acc, mem, 0, sz);
             regs_.rdi += step;
         };
@@ -1323,8 +1342,8 @@ void CPU::execute(const DecodedInsn& insn) {
     case Mnemonic::CMPS: {
         int step = flag_df(regs_) ? -sz : sz;
         auto do_one = [&]() {
-            uint64_t a = mem_read_(regs_.rsi, sz);
-            uint64_t b = mem_read_(regs_.rdi, sz);
+            uint64_t a = ld(regs_.rsi, sz);
+            uint64_t b = ld(regs_.rdi, sz);
             flags_sub(regs_, a, b, 0, sz);
             regs_.rsi += step; regs_.rdi += step;
         };
@@ -1507,7 +1526,7 @@ void CPU::execute(const DecodedInsn& insn) {
         break;
     case Mnemonic::CLZERO: {
         uint64_t line = regs_.rax & ~63ULL;
-        for (int i = 0; i < 64; i += 8) mem_write_(line + i, 0, 8);
+        for (int i = 0; i < 64; i += 8) st(line + i, 0, 8);
         break;
     }
 
@@ -1565,12 +1584,12 @@ void CPU::execute(const DecodedInsn& insn) {
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Reg && insn.src.type == OperandType::Mem) {
             const int dst_r = insn.dst.reg & 15;
-            uint32_t v = static_cast<uint32_t>(mem_read_(eff_addr(insn.src), 4));
+            uint32_t v = static_cast<uint32_t>(ld(eff_addr(insn.src), 4));
             regs_.ymm[dst_r].lo = {};
             regs_.ymm[dst_r].lo.d[0] = v;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Mem) {
-            mem_write_(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.d[0], 4);
+            st(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.d[0], 4);
         }
         break;
     }
@@ -1586,12 +1605,12 @@ void CPU::execute(const DecodedInsn& insn) {
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Reg && insn.src.type == OperandType::Mem) {
             const int dst_r = insn.dst.reg & 15;
-            uint64_t v = mem_read_(eff_addr(insn.src), 8);
+            uint64_t v = ld(eff_addr(insn.src), 8);
             regs_.ymm[dst_r].lo = {};
             regs_.ymm[dst_r].lo.q[0] = v;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Mem) {
-            mem_write_(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
+            st(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
         }
         break;
     }
@@ -1602,12 +1621,12 @@ void CPU::execute(const DecodedInsn& insn) {
             const int dst_r = insn.dst.reg & 15;
             uint64_t v = (insn.src.type == OperandType::Reg)
                 ? regs_.ymm[insn.src.reg & 15].lo.q[0]
-                : mem_read_(eff_addr(insn.src), 8);
+                : ld(eff_addr(insn.src), 8);
             regs_.ymm[dst_r].lo.q[0] = v;
             regs_.ymm[dst_r].lo.q[1] = 0;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Mem) {
-            mem_write_(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
+            st(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
         }
         break;
     }
@@ -1618,11 +1637,11 @@ void CPU::execute(const DecodedInsn& insn) {
             const int dst_r  = insn.dst.reg & 15;
             const int src1_r = is_vex ? (insn.prefixes.vex_vvvv & 15) : dst_r;
             regs_.ymm[16].lo = regs_.ymm[src1_r].lo;
-            regs_.ymm[16].lo.q[0] = mem_read_(eff_addr(insn.src), 8);
+            regs_.ymm[16].lo.q[0] = ld(eff_addr(insn.src), 8);
             regs_.ymm[dst_r].lo = regs_.ymm[16].lo;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Mem) {
-            mem_write_(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
+            st(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[0], 8);
         }
         break;
     }
@@ -1633,11 +1652,11 @@ void CPU::execute(const DecodedInsn& insn) {
             const int dst_r  = insn.dst.reg & 15;
             const int src1_r = is_vex ? (insn.prefixes.vex_vvvv & 15) : dst_r;
             regs_.ymm[16].lo = regs_.ymm[src1_r].lo;
-            regs_.ymm[16].lo.q[1] = mem_read_(eff_addr(insn.src), 8);
+            regs_.ymm[16].lo.q[1] = ld(eff_addr(insn.src), 8);
             regs_.ymm[dst_r].lo = regs_.ymm[16].lo;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         } else if (insn.dst.type == OperandType::Mem) {
-            mem_write_(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[1], 8);
+            st(eff_addr(insn.dst), regs_.ymm[insn.src.reg & 15].lo.q[1], 8);
         }
         break;
     }
@@ -1688,7 +1707,7 @@ void CPU::execute(const DecodedInsn& insn) {
         } else {
             uint64_t q = (insn.src.type == OperandType::Reg)
                 ? regs_.ymm[insn.src.reg & 15].lo.q[0]
-                : mem_read_(eff_addr(insn.src), 8);
+                : ld(eff_addr(insn.src), 8);
             regs_.ymm[dst_r].lo.q[0] = regs_.ymm[dst_r].lo.q[1] = q;
             if (is_vex) regs_.ymm[dst_r].hi = {};
         }
@@ -2035,7 +2054,7 @@ void CPU::execute(const DecodedInsn& insn) {
         int msz = insn.op_size == 8 ? 8 : 4;
         if (insn.dst.type == OperandType::Reg && insn.dst.size >= 16) {
             uint64_t v = (insn.src.type == OperandType::Reg) ? read_operand(insn.src)
-                                                             : mem_read_(eff_addr(insn.src), msz);
+                                                             : ld(eff_addr(insn.src), msz);
             if (msz == 4) v &= 0xFFFFFFFFull;
             const int dst_r = insn.dst.reg & 15;
             regs_.ymm[dst_r].lo.q[0] = v;
@@ -2045,7 +2064,7 @@ void CPU::execute(const DecodedInsn& insn) {
             uint64_t v = regs_.ymm[insn.src.reg & 15].lo.q[0];
             if (msz == 4) v &= 0xFFFFFFFFull;
             if (insn.dst.type == OperandType::Reg) write_operand(insn.dst, v);
-            else mem_write_(eff_addr(insn.dst), v, msz);
+            else st(eff_addr(insn.dst), v, msz);
         }
         break;
     }
@@ -2221,7 +2240,7 @@ void CPU::execute(const DecodedInsn& insn) {
                 f0 = regs_.ymm[insn.src.reg & 15].lo.f[0];
                 f1 = regs_.ymm[insn.src.reg & 15].lo.f[1];
             } else {
-                uint64_t raw = mem_read_(eff_addr(insn.src), 8);
+                uint64_t raw = ld(eff_addr(insn.src), 8);
                 f0 = std::bit_cast<float>(static_cast<uint32_t>(raw & 0xFFFFFFFFu));
                 f1 = std::bit_cast<float>(static_cast<uint32_t>(raw >> 32));
             }
@@ -2286,7 +2305,7 @@ void CPU::execute(const DecodedInsn& insn) {
                 i0 = static_cast<int32_t>(regs_.ymm[insn.src.reg & 15].lo.d[0]);
                 i1 = static_cast<int32_t>(regs_.ymm[insn.src.reg & 15].lo.d[1]);
             } else {
-                uint64_t raw = mem_read_(eff_addr(insn.src), 8);
+                uint64_t raw = ld(eff_addr(insn.src), 8);
                 i0 = static_cast<int32_t>(raw & 0xFFFFFFFFu);
                 i1 = static_cast<int32_t>(raw >> 32);
             }
@@ -2402,7 +2421,7 @@ void CPU::execute(const DecodedInsn& insn) {
         if (insn.src.type == OperandType::Reg)
             elem = regs_.ymm[insn.src.reg & 15].lo.d[(imm >> 6) & 3];
         else
-            elem = static_cast<uint32_t>(mem_read_(eff_addr(insn.src), 4));
+            elem = static_cast<uint32_t>(ld(eff_addr(insn.src), 4));
         regs_.ymm[16].lo = regs_.ymm[src1_r].lo;
         regs_.ymm[16].lo.d[(imm >> 4) & 3] = elem;
         for (int i = 0; i < 4; ++i)
@@ -2417,7 +2436,7 @@ void CPU::execute(const DecodedInsn& insn) {
         const int  dst_r  = insn.dst.reg & 15;
         uint32_t v = (insn.src.type == OperandType::Reg)
             ? regs_.ymm[insn.src.reg & 15].lo.d[0]
-            : static_cast<uint32_t>(mem_read_(eff_addr(insn.src), 4));
+            : static_cast<uint32_t>(ld(eff_addr(insn.src), 4));
         for (int i = 0; i < 4; ++i) regs_.ymm[dst_r].lo.d[i] = v;
         if (is_256) { for (int i = 0; i < 4; ++i) regs_.ymm[dst_r].hi.d[i] = v; }
         else        { regs_.ymm[dst_r].hi = {}; }
@@ -2428,7 +2447,7 @@ void CPU::execute(const DecodedInsn& insn) {
         const int  dst_r  = insn.dst.reg & 15;
         uint64_t v = (insn.src.type == OperandType::Reg)
             ? regs_.ymm[insn.src.reg & 15].lo.q[0]
-            : mem_read_(eff_addr(insn.src), 8);
+            : ld(eff_addr(insn.src), 8);
         regs_.ymm[dst_r].lo.q[0] = regs_.ymm[dst_r].lo.q[1] = v;
         if (is_256) { regs_.ymm[dst_r].hi.q[0] = regs_.ymm[dst_r].hi.q[1] = v; }
         else        { regs_.ymm[dst_r].hi = {}; }
@@ -2446,7 +2465,7 @@ void CPU::execute(const DecodedInsn& insn) {
         const int  dst_r  = insn.dst.reg & 15;
         uint8_t v = (insn.src.type == OperandType::Reg)
             ? regs_.ymm[insn.src.reg & 15].lo.b[0]
-            : static_cast<uint8_t>(mem_read_(eff_addr(insn.src), 1));
+            : static_cast<uint8_t>(ld(eff_addr(insn.src), 1));
         for (int i = 0; i < 16; ++i) regs_.ymm[dst_r].lo.b[i] = v;
         if (is_256) { for (int i = 0; i < 16; ++i) regs_.ymm[dst_r].hi.b[i] = v; }
         else        { regs_.ymm[dst_r].hi = {}; }
@@ -2457,7 +2476,7 @@ void CPU::execute(const DecodedInsn& insn) {
         const int  dst_r  = insn.dst.reg & 15;
         uint16_t v = (insn.src.type == OperandType::Reg)
             ? regs_.ymm[insn.src.reg & 15].lo.w[0]
-            : static_cast<uint16_t>(mem_read_(eff_addr(insn.src), 2));
+            : static_cast<uint16_t>(ld(eff_addr(insn.src), 2));
         for (int i = 0; i < 8; ++i) regs_.ymm[dst_r].lo.w[i] = v;
         if (is_256) { for (int i = 0; i < 8; ++i) regs_.ymm[dst_r].hi.w[i] = v; }
         else        { regs_.ymm[dst_r].hi = {}; }
@@ -3045,8 +3064,8 @@ void CPU::execute(const DecodedInsn& insn) {
         } else {
             uint64_t a = eff_addr(insn.src);
             int n = insn.src.size;
-            if (n >= 8) { s.q[0] = mem_read_(a, 8); if (n >= 16) s.q[1] = mem_read_(a + 8, 8); }
-            else        { s.q[0] = mem_read_(a, n); }
+            if (n >= 8) { s.q[0] = ld(a, 8); if (n >= 16) s.q[1] = ld(a + 8, 8); }
+            else        { s.q[0] = ld(a, n); }
         }
         YMMRegister out{};
         int lanes = is_256 ? 2 : 1;
@@ -3240,11 +3259,11 @@ void CPU::execute(const DecodedInsn& insn) {
             YMMRegister res{};
             for (int i = 0; i < 4; ++i)
                 if (regs_.ymm[mask_r].lo.d[i] & 0x80000000u)
-                    res.lo.d[i] = static_cast<uint32_t>(mem_read_(a + i * 4, 4));
+                    res.lo.d[i] = static_cast<uint32_t>(ld(a + i * 4, 4));
             if (is_256) {
                 for (int i = 0; i < 4; ++i)
                     if (regs_.ymm[mask_r].hi.d[i] & 0x80000000u)
-                        res.hi.d[i] = static_cast<uint32_t>(mem_read_(a + 16 + i * 4, 4));
+                        res.hi.d[i] = static_cast<uint32_t>(ld(a + 16 + i * 4, 4));
             }
             regs_.ymm[dst_r] = res;
         } else {
@@ -3252,11 +3271,11 @@ void CPU::execute(const DecodedInsn& insn) {
             uint64_t a = eff_addr(insn.dst);
             for (int i = 0; i < 4; ++i)
                 if (regs_.ymm[mask_r].lo.d[i] & 0x80000000u)
-                    mem_write_(a + i * 4, regs_.ymm[src_r].lo.d[i], 4);
+                    st(a + i * 4, regs_.ymm[src_r].lo.d[i], 4);
             if (is_256) {
                 for (int i = 0; i < 4; ++i)
                     if (regs_.ymm[mask_r].hi.d[i] & 0x80000000u)
-                        mem_write_(a + 16 + i * 4, regs_.ymm[src_r].hi.d[i], 4);
+                        st(a + 16 + i * 4, regs_.ymm[src_r].hi.d[i], 4);
             }
         }
         break;
@@ -3271,11 +3290,11 @@ void CPU::execute(const DecodedInsn& insn) {
             YMMRegister res{};
             for (int i = 0; i < 2; ++i)
                 if (regs_.ymm[mask_r].lo.q[i] >> 63)
-                    res.lo.q[i] = mem_read_(a + i * 8, 8);
+                    res.lo.q[i] = ld(a + i * 8, 8);
             if (is_256) {
                 for (int i = 0; i < 2; ++i)
                     if (regs_.ymm[mask_r].hi.q[i] >> 63)
-                        res.hi.q[i] = mem_read_(a + 16 + i * 8, 8);
+                        res.hi.q[i] = ld(a + 16 + i * 8, 8);
             }
             regs_.ymm[dst_r] = res;
         } else {
@@ -3283,11 +3302,11 @@ void CPU::execute(const DecodedInsn& insn) {
             uint64_t a = eff_addr(insn.dst);
             for (int i = 0; i < 2; ++i)
                 if (regs_.ymm[mask_r].lo.q[i] >> 63)
-                    mem_write_(a + i * 8, regs_.ymm[src_r].lo.q[i], 8);
+                    st(a + i * 8, regs_.ymm[src_r].lo.q[i], 8);
             if (is_256) {
                 for (int i = 0; i < 2; ++i)
                     if (regs_.ymm[mask_r].hi.q[i] >> 63)
-                        mem_write_(a + 16 + i * 8, regs_.ymm[src_r].hi.q[i], 8);
+                        st(a + 16 + i * 8, regs_.ymm[src_r].hi.q[i], 8);
             }
         }
         break;
@@ -3308,8 +3327,8 @@ void CPU::execute(const DecodedInsn& insn) {
             regs_.ymm[dst_r].hi = {};
         } else {
             uint64_t a = eff_addr(insn.dst);
-            mem_write_(a, res.q[0], 8);
-            if (is_256) mem_write_(a + 8, res.q[1], 8);
+            st(a, res.q[0], 8);
+            if (is_256) st(a + 8, res.q[1], 8);
         }
         break;
     }
@@ -3322,8 +3341,8 @@ void CPU::execute(const DecodedInsn& insn) {
             s = regs_.ymm[insn.src.reg & 15].lo;
         } else {
             uint64_t a = eff_addr(insn.src);
-            s.q[0] = mem_read_(a, 8);
-            if (is_256) s.q[1] = mem_read_(a + 8, 8);
+            s.q[0] = ld(a, 8);
+            if (is_256) s.q[1] = ld(a + 8, 8);
         }
         YMMRegister res{};
         for (int i = 0; i < 4; ++i) res.lo.f[i] = f16_to_f32(s.w[i]);
