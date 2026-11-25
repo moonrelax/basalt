@@ -1721,6 +1721,26 @@ void DllRunner::handle_thunk(const Thunk& t) {
             mst.stub_desc = "CreateCommittedResource";
             return ret(0);
         }
+        if (iid == "{5405c344-d457-444e}" && m_idx == 70) {
+            static int logs = 0;
+            if (logs < 4) {
+                ++logs;
+                auto dump = [&](const char* name, uint64_t p) {
+                    std::fprintf(stderr, "    [m70] %s=0x%llx", name,
+                                 static_cast<unsigned long long>(p));
+                    if (p > 0x10000 && p < memory::XBSS_RAM_SIZE) {
+                        for (int i = 0; i < 4; ++i) {
+                            uint64_t q = mem_.read64(p + static_cast<uint64_t>(i) * 8);
+                            std::fprintf(stderr, " %llx", static_cast<unsigned long long>(q));
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
+                };
+                dump("rdx", arg(1));
+                dump("r8", arg(2));
+                dump("r9", arg(3));
+            }
+        }
         // Device method 80 (vtbl+0x280) at exe+0x2482448. The out pointer is the
         // 6th argument; the caller then presents that object from the queue.
         if (iid == "{5405c344-d457-444e}" && m_idx == 80) {

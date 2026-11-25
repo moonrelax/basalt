@@ -619,19 +619,58 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                         // slots the fill never returns and no draw is recorded.
                         // The load-factor check stays true, so every insert rebuilds the
                         // table and the frame that would draw never runs.
-                        if (r.rip == 0x145a292efULL || r.rip == 0x141cd3defULL) {
-                            static uint32_t grow_calls = 0;
-                            if (r.rip == 0x145a292efULL) ++grow_calls;
-                            if (grow_calls > 32) {
-                                if (grow_calls == 33 && r.rip == 0x145a292efULL)
-                                    std::fprintf(stderr, "  [native] stopped hash rebuilds\n");
-                                if (r.rip == 0x145a292efULL) {
-                                    r.rip = 0x145a2935bULL;
-                                } else {
-                                    if (r.rdx > 0x10000) mem_.write8(r.rdx + 0x10, 0);
-                                    r.rip = 0x141cd3ef3ULL;
-                                }
+                        // A directory count in the millions makes path lookup consume
+                        // the whole run. Keep a small prefix and let the caller move on.
+                        if (r.rip == 0x1413bc5ceULL && r.rcx < 0x10000) {
+                            if (r.rdx > 0x10000) mem_.write8(r.rdx + 0x10, 0);
+                            r.rip = 0x1413bc6c7ULL;
+                        }
+                        if (r.rip == 0x1413bc7aeULL && r.rcx < 0x10000)
+                            r.rip = 0x1413bc8f7ULL;
+                        if (r.rip == 0x1413bc7aeULL && r.rcx > 0x10000 && mem_.read32(r.rcx) != 0) {
+                            mem_.write32(r.rcx + 4, 0);
+                            r.rip = 0x1413bc8f7ULL;
+                            static int kept2 = 0;
+                            if (kept2++ < 2)
+                                std::fprintf(stderr, "  [native] hash insert kept\n");
+                        }
+                        if (r.rip == 0x140048ca1ULL && r.rcx > 0x10000) {
+                            uint32_t cnt = mem_.read32(r.rcx + 0xc04);
+                            if (cnt > 4096) {
+                                mem_.write32(r.rcx + 0xc04, 64);
+                                static int dir_logs = 0;
+                                if (dir_logs++ < 4)
+                                    std::fprintf(stderr, "  [native] directory count %u capped\n", cnt);
                             }
+                        }
+                        if (r.rip >= 0x142edd8d4ULL && r.rip < 0x142edd92aULL) {
+                            static uint64_t walks = 0;
+                            walks += n;
+                            if (walks > 2000000ULL) {
+                                std::fprintf(stderr, "  [native] object walk did not end, leaving it\n");
+                                r.rip = 0x142edd96fULL;
+                                walks = 0;
+                            }
+                        }
+                        // The table pointer is 0x30 here: the container was never
+                        // created, and the grow faults on that address forever.
+                        if (r.rip == 0x141dc543bULL && r.rbx < 0x10000) {
+                            static int logs = 0;
+                            if (logs++ < 2)
+                                std::fprintf(stderr, "  [native] skip empty hash container\n");
+                            r.rip = 0x141dc5570ULL;
+                        }
+                        if (r.rip == 0x141dc5385ULL && r.rbx < 0x10000)
+                            r.rip = 0x141dc53c1ULL;
+                        if (r.rip == 0x141cd3defULL && r.rcx < 0x10000) {
+                            if (r.rdx > 0x10000) mem_.write8(r.rdx + 0x10, 0);
+                            r.rip = 0x141cd3ef3ULL;
+                        }
+                        if (r.rip == 0x145a292efULL && r.rcx < 0x10000)
+                            r.rip = 0x145a2935bULL;
+                        if (r.rip == 0x145a292efULL && r.rcx > 0x10000 && mem_.read32(r.rcx) != 0) {
+                            mem_.write32(r.rcx + 4, 0);
+                            r.rip = 0x145a2935bULL;
                         }
                         if (r.rip >= 0x141cd3f85ULL && r.rip < 0x141cd3f90ULL) {
                             static uint64_t wraps = 0;
