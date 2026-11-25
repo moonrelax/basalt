@@ -1,3 +1,4 @@
+#include <map>
 #include "kernel/scheduler.h"
 #include "host/guest_window.h"
 #include "cpu/mnemonic_names.h"
@@ -7,6 +8,7 @@
 #include <csignal>
 #include <cstring>
 #include <vector>
+extern "C" uint64_t basalt_last_addr;
 
 
 static uint64_t g_rip_ring[32];
@@ -329,7 +331,7 @@ void Scheduler::wake_waiting_threads() {
                 }
             }
             if (all_sig) {
-                for (uint64_t h : t.wait_handles) runner_.try_acquire_event(h);
+                for (uint64_t h : t.wait_handles) runner_.try_acquire_event(h, t.tid);
                 t.wait_handles.clear();
                 t.regs.rax = t.wake_rax;
                 t.state = ThreadState::Ready;
@@ -337,7 +339,7 @@ void Scheduler::wake_waiting_threads() {
         } else {
             for (size_t i = 0; i < t.wait_handles.size(); ++i) {
                 if (runner_.is_event_signaled(t.wait_handles[i])) {
-                    runner_.try_acquire_event(t.wait_handles[i]);
+                    runner_.try_acquire_event(t.wait_handles[i], t.tid);
                     t.wait_handles.clear();
                     t.regs.rax = t.wake_rax ? t.wake_rax : static_cast<uint64_t>(i);
                     t.state = ThreadState::Ready;
@@ -368,6 +370,15 @@ void Scheduler::report_thread_fault(const GuestThread& t) const {
                  static_cast<unsigned long long>(r.r8),  static_cast<unsigned long long>(r.r9));
     std::fprintf(stderr, "     thread insns executed: %llu\n",
                  static_cast<unsigned long long>(t.insns));
+    {
+        uint64_t tlsarr = mem_.read64(r.msr_gs_base + 0x58);
+        uint64_t tlsblk = tlsarr ? mem_.read64(tlsarr) : 0;
+        std::fprintf(stderr, "     [rcx]=%llx [rcx+16]=%llx tls_tid=%x gs=%llx\n",
+                     (unsigned long long)mem_.read64(r.rcx),
+                     (unsigned long long)mem_.read64(r.rcx + 16),
+                     tlsblk ? mem_.read32(tlsblk + 0x1454) : 0xdead,
+                     (unsigned long long)r.msr_gs_base);
+    }
 }
 
 void Scheduler::print_summary() const {
@@ -384,6 +395,15 @@ void Scheduler::print_summary() const {
             extra += "]";
         }
         extra += " rip=" + runner_.where(t.regs.rip);
+        {
+            char b[160];
+            uint64_t ta = mem_.read64(t.regs.msr_gs_base + 0x58);
+            uint64_t tb = ta ? mem_.read64(ta) : 0;
+            std::snprintf(b, sizeof b, " rcx=%llx [rcx]=%llx tls_tid=%x",
+                (unsigned long long)t.regs.rcx, (unsigned long long)(t.regs.rcx > 0x10000 ? mem_.read64(t.regs.rcx) : 0),
+                tb ? mem_.read32(tb + 0x1454) : 0xdead);
+            extra += b;
+        }
         std::fprintf(stderr, "    tid=%-4u %-12s entry=0x%-12llx state=%-9s insns=%-10llu slices=%-6llu %s\n",
                      t.tid, t.name.c_str(),
                      static_cast<unsigned long long>(t.entry),
@@ -480,7 +500,9 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
             {
                 uint64_t ibase = 0, iend = 0;
                 if (runner_.image_span(r.rip, ibase, iend)) {
-                    if (cpu_.identity() && r.rip >= 0x10000 && r.rip < 0x400000000ULL) {
+                    static uint64_t interp_lo = 0, interp_hi = 0; static bool interp_init = false;
+                    if (!interp_init) { interp_init = true; if (const char* e = std::getenv("BASALT_INTERP")) { unsigned long long a=0,b=0; if (std::sscanf(e, "%llx,%llx", &a, &b) == 2) { interp_lo = 0x140000000ULL + a; interp_hi = 0x140000000ULL + b; } } }
+                    if (cpu_.identity() && r.rip >= 0x10000 && r.rip < 0x400000000ULL && !(r.rip >= interp_lo && r.rip < interp_hi)) {
                         static int entry_logs = 0;
                         if (entry_logs < 4) {
                             ++entry_logs;
@@ -566,6 +588,24 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                         // A trap is one guest instruction plus the host signal.
                         // Counting the signal time made a Sleep loop burn the budget.
                         if (stop == cpu::NativeStop::Trap && n > 64) n = 64;
+                        if (r.rip >= 0x142157654ULL && r.rip < 0x1421583b8ULL) {
+                            static uint64_t inf_n[256];
+                            if ((++inf_n[t.tid & 255] & 0x3fff) == 1)
+                                std::fprintf(stderr, "  [inflate] stop=%d n_est=%llu tid=%u n=%llu in=%llx end=%llx out=%llx\n", (int)stop, (unsigned long long)n, t.tid,
+                                             (unsigned long long)inf_n[t.tid & 255], (unsigned long long)r.r12,
+                                             (unsigned long long)r.rbp, (unsigned long long)r.rsi);
+                            static int dumps = 0;
+                            if (dumps < 12 && r.r12 >= 0x1400000000ULL && r.r12 < 0x1400200000ULL) {
+                                ++dumps;
+                                const uint8_t* b = reinterpret_cast<const uint8_t*>(r.r12 & ~0xfULL);
+                                std::fprintf(stderr, "  [inflate-in] %llx:", (unsigned long long)(r.r12 & ~0xfULL));
+                                for (int i = 0; i < 48; ++i) std::fprintf(stderr, " %02x", mem_.read8(reinterpret_cast<uint64_t>(b) + i));
+                                const uint8_t* h = reinterpret_cast<const uint8_t*>(0x1400000000ULL);
+                                std::fprintf(stderr, "\n  [region-head]");
+                                for (int i = 0; i < 48; ++i) std::fprintf(stderr, " %02x", mem_.read8(reinterpret_cast<uint64_t>(h) + i));
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
                         uint64_t before = total_insns_;
                         slice_insns += n;
                         t.insns += n;
@@ -609,6 +649,92 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                                              "  [tls] mount %s idx=%u flag=%u\n",
                                              runner_.where(r.rip).c_str(), idx,
                                              blk ? mem_.read8(blk + 8) : 0);
+                            }
+                        }
+                        // Try-lock compares the qword with the CRT sentinel. A zero qword
+                        // was never initialised. A non-sentinel owner that no live
+                        // thread still has in its TLS id will never release it.
+                        if (r.rip == 0x1454f5126ULL && r.rcx == 0x1478f6940ULL &&
+                            r.rsi != 0xFFFFFFFF00000000ULL) {
+                            uint32_t owner = static_cast<uint32_t>(r.rsi >> 32);
+                            bool live = false;
+                            if (r.rsi != 0) {
+                                for (const auto& th : threads_) {
+                                    if (th.state == ThreadState::Finished || th.state == ThreadState::Faulted)
+                                        continue;
+                                    uint64_t teb = th.regs.msr_gs_base;
+                                    if (teb < 0x10000) continue;
+                                    uint64_t arr = mem_.read64(teb + 0x58);
+                                    if (arr < 0x10000) continue;
+                                    uint64_t tls = mem_.read64(arr);
+                                    if (tls < 0x10000) continue;
+                                    if (mem_.read32(tls + 0x1454) == owner) { live = true; break; }
+                                }
+                            }
+                            if (!live) {
+                                mem_.write64(r.rcx, 0xFFFFFFFF00000000ULL);
+                                r.rsi = 0xFFFFFFFF00000000ULL;
+                                static int locks = 0;
+                                if (locks++ < 2)
+                                    std::fprintf(stderr, "  [native] render lock free, owner=%u\n", owner);
+                            }
+                        }
+                        // The published sample lags the counter the producer already
+                        // stored. The reader at this instruction is the clock the
+                        // render wait compares with its deadline.
+                        if (r.rip == 0x1400065f4ULL) {
+                            uint64_t published = mem_.read64(0x149c3e0a0ULL);
+                            uint64_t counter = mem_.read64(0x149c3e0a8ULL);
+                            if (published < counter) {
+                                mem_.write64(0x149c3e0a0ULL, counter);
+                                static int clocks = 0;
+                                if (clocks++ < 2)
+                                    std::fprintf(stderr, "  [native] render clock %llu -> %llu\n",
+                                                 static_cast<unsigned long long>(published),
+                                                 static_cast<unsigned long long>(counter));
+                            }
+                        }
+                        if (r.rip >= 0x140054e1fULL && r.rip < 0x140054e50ULL) {
+                            static int budget_logs = 0;
+                            if (budget_logs < 2) {
+                                ++budget_logs;
+                                std::fprintf(stderr,
+                                             "  [native] budget al=%u edi=%u b8=%u c1=%u acc=%u "
+                                             "b0=%u b4=%u open=%llx be=%u caller=%llx job=%llx\n",
+                                             static_cast<unsigned>(r.rax & 0xff),
+                                             static_cast<unsigned>(r.rdi & 0xffffffffu),
+                                             mem_.read32(0x149c3e0b8ULL),
+                                             mem_.read8(0x149c3e0c1ULL),
+                                             mem_.read32(0x1478f6968ULL),
+                                             mem_.read32(0x149c3e0b0ULL),
+                                             mem_.read32(0x149c3e0b4ULL),
+                                             static_cast<unsigned long long>(mem_.read64(0x149c3e090ULL)),
+                                             mem_.read8(0x149c3e0beULL),
+                                             static_cast<unsigned long long>(mem_.read64(r.rsp + 0x48)),
+                                             static_cast<unsigned long long>(mem_.read64(0x14a210d18ULL)));
+                                for (const auto& t : threads_) {
+                                    if (t.state == ThreadState::Finished || t.state == ThreadState::Faulted)
+                                        continue;
+                                    uint64_t fn = t.param > 0x10000 ? mem_.read64(t.param) : 0;
+                                    std::fprintf(stderr,
+                                                 "    [native] tid=%u state=%u rip=%llx fn=%llx\n",
+                                                 t.tid, static_cast<unsigned>(t.state),
+                                                 static_cast<unsigned long long>(t.regs.rip),
+                                                 static_cast<unsigned long long>(fn));
+                                }
+                                std::fflush(stderr);
+                            }
+                        }
+                        // The list walk stops when the embedded end node at +0xf4 is -1.
+                        // A zero there is an uninitialised end marker, so the walk repeats.
+                        if (r.rip == 0x141de2c5dULL && r.r14 > 0x10000) {
+                            uint64_t mark = r.r14 + 0xf4;
+                            if (mem_.read32(mark) == 0) {
+                                mem_.write32(mark, 0xffffffffu);
+                                static int walks = 0;
+                                if (walks++ < 2)
+                                    std::fprintf(stderr, "  [native] list end marked, count=%u\n",
+                                                 mem_.read32(r.r14 + 4));
                             }
                         }
                         // A full name table never finds an empty slot and doubles
@@ -789,6 +915,13 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                             }
                             break;
                         }
+                        if (stop == cpu::NativeStop::Fault &&
+                            basalt_last_addr >= memory::XBSS_RAM_SIZE &&
+                            basalt_last_addr < (0x400000000ULL << 4) &&
+                            mem_.back_sparse(basalt_last_addr)) {
+                            // Page now sits at its own address: run it again natively.
+                            continue;
+                        }
                         if (stop == cpu::NativeStop::Fault) {
                             uint8_t op = mem_.read8(r.rip);
                             if ((op == 0xCC || op == 0xF4) && runner_.loader().thunk_at(r.rip)) {
@@ -834,6 +967,19 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     int burst = 8192;
                     while (burst-- && slice_insns < quantum && total_insns_ < total_budget) {
                         if (r.rip < ibase || r.rip >= iend) break;
+                        for (uint64_t pa : g_probes) if (pa == r.rip) {
+                            static uint32_t bhits[256] = {};
+                            if (++bhits[(t.tid / 4) & 255] > 40) break;
+                            std::fprintf(stderr, "    [bprobe] tid=%u rva=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx r12=0x%llx rsi=0x%llx inend=0x%llx outend=0x%llx in8=%016llx ret=0x%llx\n",
+                                         t.tid, (unsigned long long)(r.rip - 0x140000000ULL), (unsigned long long)r.rcx,
+                                         (unsigned long long)r.rdx, (unsigned long long)r.r8, (unsigned long long)r.r9,
+                                         (unsigned long long)r.r12, (unsigned long long)r.rsi,
+                                         (unsigned long long)mem_.read64(r.rsp + 0xa0), (unsigned long long)mem_.read64(r.rsp + 0x90),
+                                         (unsigned long long)mem_.read64(r.r12), (unsigned long long)(mem_.read64(r.rsp) - 0x140000000ULL));
+                            std::fprintf(stderr, "    [bstack] tid=%u", t.tid);
+                            for (int k = 0, n = 0; k < 2400 && n < 14; ++k) { uint64_t v = mem_.read64(r.rsp + 8ULL * k); if (v >= ibase + 0x1000 && v < iend && ++n) std::fprintf(stderr, " +%x:%llx", k * 8, (unsigned long long)(v - 0x140000000ULL)); }
+                            std::fprintf(stderr, "\n");
+                        }
                         if (crt_fast(mem_, r)) {
                             ++slice_insns;
                             ++t.insns;
@@ -888,6 +1034,10 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
             }
 
             if (const Thunk* tk = runner_.loader().thunk_at(r.rip)) {
+                { static std::map<std::string,uint64_t> h; static uint64_t n=0;
+                  h[std::to_string(t.tid)+" "+tk->name+" ret="+std::to_string(mem_.read64(r.rsp))]++;
+                  if ((++n & 0x3fff)==0) { std::fprintf(stderr,"[thunk-hist]\n");
+                    for (auto& [k,v]: h) if (v>200) std::fprintf(stderr,"  %8llu %s\n",(unsigned long long)v,k.c_str()); } }
                 uint64_t before = runner_.insn_count();
                 runner_.handle_thunk(*tk);
                 uint64_t delta = runner_.insn_count() - before;
@@ -1001,6 +1151,11 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                                      static_cast<unsigned long long>(r.rip),
                                      static_cast<unsigned long long>(r.rax),
                                      runner_.where(ret).c_str());
+                        if (true)
+                            for (unsigned k = 16; k < 32; ++k) {
+                                uint64_t v = g_rip_ring[(g_rip_ring_i + k) & 31];
+                                if (v) std::fprintf(stderr, "      [ring] tid=%u %s\n", t.tid, runner_.where(v).c_str());
+                            }
                     }
                     // Poison is an empty slot. The caller at exe+0x4fac3d7
                     // treats a non-zero result as "already done" and retries.
@@ -1053,6 +1208,10 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                              (unsigned long long)r.rcx, (unsigned long long)r.rdx, (unsigned long long)r.r8,
                              (unsigned long long)r.r9, (int)mem_.read32(r.rcx + 0xc04),
                              (unsigned long long)(mem_.read64(r.rsp) - 0x140000000ULL), str);
+                std::fprintf(stderr, "    [probe2] r12=0x%llx rsi=0x%llx inend=0x%llx outend=0x%llx in8=%016llx\n",
+                             (unsigned long long)r.r12, (unsigned long long)r.rsi,
+                             (unsigned long long)mem_.read64(r.rsp + 0xa0), (unsigned long long)mem_.read64(r.rsp + 0x90),
+                             (unsigned long long)mem_.read64(r.r12));
             }
             cpu_.step();
             ++slice_insns;

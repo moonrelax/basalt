@@ -7,13 +7,15 @@ OBJ      := build/obj
 
 CORE := src/cpu/cpu.cpp src/cpu/decoder.cpp src/cpu/executor.cpp \
         src/memory/memory_map.cpp src/memory/mmu.cpp
+GPU  := src/gpu/shader_rdna2.cpp src/gpu/rasterizer.cpp
 APP  := src/gpu/command_processor.cpp src/gpu/ring_buffer.cpp \
-        src/gpu/d3d12_xs.cpp src/gpu/swapchain.cpp \
+        src/gpu/d3d12_xs.cpp src/gpu/swapchain.cpp $(GPU) \
         src/hal/interrupt_controller.cpp src/hal/timer.cpp \
         src/bus/pcie_bus.cpp src/host/guest_window.cpp src/kernel/loader.cpp \
         src/kernel/xbox_gdk_stubs.cpp src/kernel/dll_runner.cpp \
         src/kernel/scheduler.cpp src/kernel/xbox_launcher.cpp src/main.cpp
-TESTS := tests/test_memory.cpp tests/test_mmu.cpp tests/test_cpu_basic.cpp tests/test_cpu_sse.cpp
+TESTS := tests/test_memory.cpp tests/test_mmu.cpp tests/test_cpu_basic.cpp tests/test_cpu_sse.cpp \
+         tests/test_gpu.cpp
 
 o = $(patsubst %.cpp,$(OBJ)/%.o,$(1))
 
@@ -22,7 +24,7 @@ tests: build/basalt_tests
 
 build/basalt: $(call o,$(CORE) $(APP)) $(OBJ)/src/cpu/native_run.o $(OBJ)/src/cpu/native_asm.o
 	$(CXX) $^ -ldl -o $@
-build/basalt_tests: $(call o,$(CORE) $(TESTS)) $(OBJ)/src/cpu/native_run.o $(OBJ)/src/cpu/native_asm.o
+build/basalt_tests: $(call o,$(CORE) $(TESTS) $(GPU)) $(OBJ)/src/cpu/native_run.o $(OBJ)/src/cpu/native_asm.o
 	$(CXX) $^ -lgtest_main -lgtest -pthread -o $@
 
 $(OBJ)/tests/%.o: CXXFLAGS += -DGTEST_HAS_PTHREAD=1

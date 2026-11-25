@@ -18,7 +18,8 @@ void Device::bind_rtv(uint64_t cpu_handle, uint64_t resource_obj) {
 const Resource* Device::rtv(uint64_t cpu_handle) const {
     auto it = rtvs_.find(cpu_handle);
     if (it == rtvs_.end()) return nullptr;
-    return resource(it->second);
+    if (const Resource* r = resource(it->second)) return r;
+    return backbuffer_ ? resource(backbuffer_) : nullptr;
 }
 
 const Resource* Device::resource(uint64_t obj) const {

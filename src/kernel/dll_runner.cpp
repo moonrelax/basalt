@@ -776,19 +776,23 @@ bool DllRunner::is_event_signaled(uint64_t h) const {
     return it->second.signaled;
 }
 
-bool DllRunner::try_acquire_event(uint64_t h) {
+bool DllRunner::try_acquire_event(uint64_t h, uint32_t tid) {
     auto it = events_.find(h);
     if (it == events_.end()) return true;
     if (!it->second.signaled) return false;
-    it->second.consume();
+    it->second.take(tid ? tid : current_tid_);
     return true;
 }
 
 uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
     auto it = events_.find(handle);
     if (it != events_.end()) {
+        if (it->second.is_mutex && it->second.recursion > 0 && it->second.owner == current_tid_) {
+            ++it->second.recursion;
+            return WAIT_OBJECT_0;
+        }
         if (it->second.signaled) {
-            it->second.consume();
+            it->second.take(current_tid_);
             return WAIT_OBJECT_0;
         }
         // timeout 0 is a poll; logging each one filled runs/ (hundreds of thousands of lines).
@@ -813,7 +817,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                     ++title_gate;
                     it->second.sem_count = 1;
                     it->second.signaled = true;
-                    it->second.consume();
+                    it->second.take(current_tid_);
                     std::fprintf(stderr, "    [sync] title-gate release h=0x%llx\n",
                                  static_cast<unsigned long long>(handle));
                     return WAIT_OBJECT_0;
@@ -827,7 +831,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                     ++gate;
                     it->second.sem_count = 1;
                     it->second.signaled = true;
-                    it->second.consume();
+                    it->second.take(current_tid_);
                     std::fprintf(stderr, "    [sync] frame-gate release h=0x%llx caller=+0x%llx\n",
                                  static_cast<unsigned long long>(handle),
                                  static_cast<unsigned long long>(outer));
@@ -858,7 +862,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                     ++tokens;
                     it->second.sem_count = 1;
                     it->second.signaled = true;
-                    it->second.consume();
+                    it->second.take(current_tid_);
                     std::fprintf(stderr, "    [sync] startup-token h=0x%llx\n",
                                  static_cast<unsigned long long>(handle));
                     return WAIT_OBJECT_0;
@@ -871,7 +875,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                 if (frames < 8) {
                     ++frames;
                     it->second.signaled = true;
-                    it->second.consume();
+                    it->second.take(current_tid_);
                     std::fprintf(stderr, "    [sync] present-fence h=0x%llx n=%d\n",
                                  static_cast<unsigned long long>(handle), frames);
                     return WAIT_OBJECT_0;
@@ -909,7 +913,7 @@ uint64_t DllRunner::wait_single(uint64_t handle, uint32_t timeout_ms) {
                     if (startup_event < 1) {
                         ++startup_event;
                         it->second.signaled = true;
-                        it->second.consume();
+                        it->second.take(current_tid_);
                         std::fprintf(stderr, "    [sync] startup-event release h=0x%llx\n",
                                      static_cast<unsigned long long>(handle));
                         return WAIT_OBJECT_0;
@@ -972,7 +976,7 @@ uint64_t DllRunner::wait_multiple(uint32_t count, uint64_t handles_ptr, bool wai
             if (auto it = events_.find(handles[i]); it != events_.end()) {
                 any_event = true;
                 if (it->second.signaled) {
-                    it->second.consume();
+                    it->second.take(current_tid_);
                     return WAIT_OBJECT_0 + i;
                 }
             }
@@ -1260,6 +1264,17 @@ void DllRunner::handle_thunk(const Thunk& t) {
         auto& mst = st.methods[{iid, m_idx}];
         ++mst.calls;
 
+        // Clock consumer: true while the producer's counter is ahead of the
+        // published sample, so the game's own updater copies it.
+        if (ret_addr == 0x1400065e9ULL) {
+            uint64_t published = mem_.read64(0x149c3e0a0ULL);
+            uint64_t counter = mem_.read64(0x149c3e0a8ULL);
+            return ret(published < counter ? 1 : 0);
+        }
+        // These two calls int3 when the method returns zero.
+        if (ret_addr == 0x140194068ULL || ret_addr == 0x140194162ULL)
+            return ret(1);
+
         if (m_idx == 0) { // IUnknown::QueryInterface(this, riid, ppvObject)
             std::string riid = format_guid(mem_, arg(1));
             uint64_t qi_obj = arg(0);
@@ -1311,6 +1326,55 @@ void DllRunner::handle_thunk(const Thunk& t) {
                     mem_.write64(arg(3), res->va);
                 mst.stub_desc = "Map";
                 return ret(0);
+            }
+        }
+        // Fences. The emulated GPU retires work at submit, so a queue
+        // Signal(fence, value) completes at once and wakes any event armed
+        // with SetEventOnCompletion.
+        {
+            static std::map<uint64_t, uint64_t> fence_value;
+            static std::multimap<uint64_t, std::pair<uint64_t, uint64_t>> fence_waits;
+            auto fire = [&](uint64_t f) {
+                for (auto w = fence_waits.lower_bound(f); w != fence_waits.end() && w->first == f;) {
+                    if (fence_value[f] >= w->second.first) {
+                        if (auto e = events_.find(w->second.second); e != events_.end()) e->second.signaled = true;
+                        w = fence_waits.erase(w);
+                    } else ++w;
+                }
+            };
+            static int fence_logs = 0;
+            auto flog = [&](const char* what, uint64_t f, uint64_t v) {
+                if (fence_logs++ < 32)
+                    std::fprintf(stderr, "    [fence] %s f=0x%llx v=%llu ret=%s\n", what,
+                                 static_cast<unsigned long long>(f), static_cast<unsigned long long>(v),
+                                 where(ret_addr).c_str());
+            };
+            if (iid == "{0ec870a6-5d7e-4c22}" && m_idx == 16) { // queue Signal
+                fence_value[arg(1)] = std::max(fence_value[arg(1)], arg(2));
+                flog("queue-signal", arg(1), arg(2));
+                fire(arg(1));
+                mst.stub_desc = "Signal";
+                return ret(0);
+            }
+            if (iid == "{0a753dcf-c4d8-4b91}") {
+                if (m_idx == 8) { mst.stub_desc = "GetCompletedValue"; return ret(fence_value[arg(0)]); }
+                if (m_idx == 9) { // SetEventOnCompletion(value, event)
+                    flog("set-event-on-completion", arg(0), arg(1));
+                    if (fence_value[arg(0)] >= arg(1) || !arg(2)) {
+                        if (auto e = events_.find(arg(2)); e != events_.end()) e->second.signaled = true;
+                    } else {
+                        fence_waits.insert({arg(0), {arg(1), arg(2)}});
+                    }
+                    mst.stub_desc = "SetEventOnCompletion";
+                    return ret(0);
+                }
+                if (m_idx == 10) { // Signal from CPU
+                    fence_value[arg(0)] = arg(1);
+                    flog("cpu-signal", arg(0), arg(1));
+                    fire(arg(0));
+                    mst.stub_desc = "Signal";
+                    return ret(0);
+                }
             }
         }
         if (iid == "{0ec870a6-5d7e-4c22}" && m_idx == 35) {
@@ -2274,7 +2338,7 @@ void DllRunner::handle_thunk(const Thunk& t) {
         uint32_t timeout_ms = static_cast<uint32_t>(arg(2));
         auto& ev = events_[cv];
         if (ev.signaled) {
-            ev.consume();
+            ev.take(current_tid_);
             return ret(1);
         }
         if (timeout_ms == 0) {
@@ -2299,7 +2363,13 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"TryAcquireSRWLockExclusive", "TryEnterCriticalSection"})) return ret(1);
     if (is({"ReleaseMutex"})) {
-        if (auto it = events_.find(arg(0)); it != events_.end()) it->second.signaled = true;
+        if (auto it = events_.find(arg(0)); it != events_.end()) {
+            auto& m = it->second;
+            if (m.recursion > 1) { --m.recursion; return ret(1); }
+            m.recursion = 0;
+            m.owner = 0;
+            m.signaled = true;
+        }
         return ret(1);
     }
     if (is({"ReleaseSemaphore"})) {
@@ -2529,12 +2599,16 @@ void DllRunner::handle_thunk(const Thunk& t) {
     // mutex = auto-reset event signaled while unowned; semaphore = counted event.
     if (is({"CreateMutexW", "CreateMutexA"})) {
         uint64_t h = (handle_next_ += 4);
-        events_[h] = EventObj{false, arg(1) == 0, read_str(arg(2), n.back() == 'W')};
+        auto& m = events_[h] = EventObj{false, arg(1) == 0, read_str(arg(2), n.back() == 'W')};
+        m.is_mutex = true;
+        if (arg(1)) { m.owner = current_tid_; m.recursion = 1; }
         return ret(h);
     }
     if (is({"CreateMutexExW"})) {
         uint64_t h = (handle_next_ += 4);
-        events_[h] = EventObj{false, (arg(2) & 0x1u) == 0, read_str(arg(1), true)};
+        auto& m = events_[h] = EventObj{false, (arg(2) & 0x1u) == 0, read_str(arg(1), true)};
+        m.is_mutex = true;
+        if (arg(2) & 0x1u) { m.owner = current_tid_; m.recursion = 1; }
         return ret(h);
     }
     if (is({"CreateSemaphoreW", "CreateSemaphoreExW"})) {
@@ -2717,6 +2791,30 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"rand_s"})) { mem_.write32(arg(0), static_cast<uint32_t>(std::rand())); return ret(0); }
     if (is({"___mb_cur_max_func"})) return ret(1);
+    if (is({"isalnum"})) { int c = static_cast<int>(arg(0)); return ret(c >= 0 && c < 128 && std::isalnum(c) ? 1 : 0); }
+    if (is({"OpenThread"})) return ret(0x7000 + arg(2));
+    if (is({"AddVectoredExceptionHandler"})) return ret(0x7f00);
+    if (is({"RemoveVectoredExceptionHandler","SetThreadIdealProcessorEx"})) return ret(1);
+    if (is({"SetThreadAffinityMask"})) return ret(1);
+    if (is({"RaiseException"})) { std::fprintf(stderr, "  [crt] RaiseException code=%llx\n", (unsigned long long)arg(0)); return ret(0); }
+    if (is({"strtod", "_strtoui64", "_strtoi64"})) {
+        std::string s;
+        for (uint64_t i = 0; i < 512; ++i) { char c = static_cast<char>(mem_.read8(arg(0) + i)); if (!c) break; s += c; }
+        char* end = nullptr;
+        uint64_t used;
+        if (is({"strtod"})) {
+            double d = std::strtod(s.c_str(), &end);
+            used = end - s.c_str();
+            if (arg(1)) mem_.write64(arg(1), arg(0) + used);
+            r.ymm[0].lo.df[0] = d;
+            return ret(0);
+        }
+        uint64_t v = is({"_strtoi64"}) ? static_cast<uint64_t>(std::strtoll(s.c_str(), &end, static_cast<int>(arg(2))))
+                                      : std::strtoull(s.c_str(), &end, static_cast<int>(arg(2)));
+        used = end - s.c_str();
+        if (arg(1)) mem_.write64(arg(1), arg(0) + used);
+        return ret(v);
+    }
     if (is({"isspace", "iswspace"})) {
         unsigned c = static_cast<unsigned>(arg(0));
         return ret(c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f');

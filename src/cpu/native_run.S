@@ -31,6 +31,13 @@ basalt_syscall_sel:
 .global basalt_stop
 basalt_stop:
     .byte 0
+.global basalt_last_sig
+basalt_last_sig:
+    .byte 0
+.align 8
+.global basalt_last_addr
+basalt_last_addr:
+    .quad 0
 .align 8
 .global basalt_regs_ptr
 basalt_regs_ptr:
@@ -179,6 +186,9 @@ basalt_sig_entry:
     movl %ecx, 24(%rax)
     ret
 8:
+    movb %dil, basalt_last_sig(%rip)
+    mov 16(%rsi), %rcx
+    mov %rcx, basalt_last_addr(%rip)
     movb $0, basalt_syscall_sel(%rip)
     movb $0, basalt_in_guest(%rip)
     mov basalt_regs_ptr(%rip), %rax

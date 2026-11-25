@@ -105,12 +105,17 @@ uint8_t* MemoryMap::sparse_bytes(uint64_t paddr, bool create) const {
     if (paddr < XBSS_RAM_SIZE) return nullptr;
     uint64_t key = paddr & ~(kSparsePage - 1);
     auto it = sparse_.find(key);
-    if (it != sparse_.end()) return it->second.get();
+    if (it != sparse_.end()) return it->second;
     if (!create || sparse_bytes_ >= kSparseCap) return nullptr;
-    auto buf = std::make_unique<uint8_t[]>(kSparsePage);
-    std::memset(buf.get(), 0, kSparsePage);
-    uint8_t* p = buf.get();
-    sparse_.emplace(key, std::move(buf));
+    // Same host address as the guest one, so the title's own code can use it.
+    uint8_t* p = static_cast<uint8_t*>(map_fixed(key, kSparsePage));
+    if (!p) {
+        void* q = mmap(nullptr, kSparsePage, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (q == MAP_FAILED) return nullptr;
+        p = static_cast<uint8_t*>(q);
+    }
+    sparse_.emplace(key, p);
     sparse_bytes_ += kSparsePage;
     if (sparse_.size() == 1)
         std::fprintf(stderr, "  [mem] backing guest page 0x%llx (above physical RAM)\n",
@@ -154,7 +159,7 @@ T MemoryMap::read_impl(uint64_t paddr) const {
                 return val;
             }
         }
-        return static_cast<T>(0xDEADBEEFDEADBEEFULL);
+        return static_cast<T>(0);
     }
 
     const MemoryRegion& r = opt->get();
@@ -252,7 +257,7 @@ void MemoryMap::visit_extra_ram(const std::function<void(uint64_t, const uint8_t
         fn(r.base, r.bytes(), r.len());
     }
     for (const auto& [base, buf] : sparse_)
-        fn(base, buf.get(), kSparsePage);
+        fn(base, buf, kSparsePage);
 }
 
 uint8_t* MemoryMap::raw_ptr(uint64_t paddr, uint64_t size) {

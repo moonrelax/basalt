@@ -99,9 +99,13 @@ private:
     // dropping the writes made later virtual calls read 0xDEADBEEF.
     static constexpr uint64_t kSparsePage = 0x10000;
     static constexpr uint64_t kSparseCap  = 512ULL << 20;
-    mutable std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> sparse_;
+    mutable std::unordered_map<uint64_t, uint8_t*> sparse_;
     mutable uint64_t sparse_bytes_ = 0;
     uint8_t* sparse_bytes(uint64_t paddr, bool create) const;
+public:
+    // Backs the page at its own host address so native code can reach it.
+    bool back_sparse(uint64_t paddr) const { return sparse_bytes(paddr, true) != nullptr; }
+private:
     // Guest RAM outside the MMIO hole. Null when the range is not plain DRAM.
     uint8_t* dram_fast(uint64_t paddr, uint64_t n);
     const uint8_t* dram_fast(uint64_t paddr, uint64_t n) const;

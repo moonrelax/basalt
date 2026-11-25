@@ -175,6 +175,25 @@ std::optional<uint64_t> Loader::find_export(const std::string& name) const {
     return std::nullopt;
 }
 
+// Hot CRT calls run as guest code: an int3 round trip per strcmp was most
+// of the loading time. Code sits in the last slots of the thunk area.
+static const uint8_t kFastCode[] = {0x0f,0xb6,0x01,0x44,0x0f,0xb6,0x02,0x44,0x29,0xc0,0x75,0x0d,0x45,0x85,0xc0,0x74,0x08,0x48,0xff,0xc1,0x48,0xff,0xc2,0xeb,0xe7,0xc3,0x31,0xc0,0x4d,0x85,0xc0,0x74,0x37,0x0f,0xb6,0x01,0x44,0x0f,0xb6,0x0a,0x44,0x8d,0x50,0xbf,0x41,0x83,0xfa,0x19,0x77,0x03,0x83,0xc0,0x20,0x45,0x8d,0x51,0xbf,0x41,0x83,0xfa,0x19,0x77,0x04,0x41,0x83,0xc1,0x20,0x44,0x29,0xc8,0x75,0x10,0x45,0x85,0xc9,0x74,0x0b,0x48,0xff,0xc1,0x48,0xff,0xc2,0x49,0xff,0xc8,0xeb,0xc4,0xc3};
+static constexpr uint64_t kFastAt = 0x3F0000000ULL + (0x10000ULL - 64) * 0x10;
+static int64_t fast_offset(const std::string& name) {
+    if (name == "strcmp") return 0;
+    if (name == "_strnicmp" || name == "strnicmp") return 26;
+    return -1;
+}
+static bool put_fast(memory::MemoryMap& mem, uint64_t addr, const std::string& name) {
+    int64_t off = fast_offset(name);
+    if (off < 0) return false;
+    for (size_t i = 0; i < sizeof kFastCode; ++i) mem.write8(kFastAt + i, kFastCode[i]);
+    int32_t rel = static_cast<int32_t>(kFastAt + off - (addr + 5));
+    mem.write8(addr, 0xE9);
+    for (int i = 0; i < 4; ++i) mem.write8(addr + 1 + i, (rel >> (8 * i)) & 0xff);
+    return true;
+}
+
 uint64_t Loader::make_thunk(const std::string& module, const std::string& name) {
     std::string key = module + "!" + name;
     if (auto it = thunk_index_.find(key); it != thunk_index_.end()) return it->second;
@@ -182,19 +201,23 @@ uint64_t Loader::make_thunk(const std::string& module, const std::string& name) 
     uint64_t addr = THUNK_BASE + thunks_.size() * THUNK_STRIDE;
     thunks_.push_back({module, name});
     thunk_index_[key] = addr;
-    mem_.write8(addr, 0xCC); // int3: native execution traps back into the HLE thunk
+    if (!put_fast(mem_, addr, name))
+        mem_.write8(addr, 0xCC); // int3: native execution traps back into the HLE thunk
     return addr;
 }
 
 const Thunk* Loader::thunk_at(uint64_t addr) const {
     if (addr < THUNK_BASE || (addr - THUNK_BASE) % THUNK_STRIDE) return nullptr;
     uint64_t i = (addr - THUNK_BASE) / THUNK_STRIDE;
-    return i < thunks_.size() ? &thunks_[i] : nullptr;
+    if (i >= thunks_.size()) return nullptr;
+    return &thunks_[i];
 }
 
 void Loader::plant_traps(memory::MemoryMap& mem) const {
-    for (size_t i = 0; i < thunks_.size(); ++i)
-        mem.write8(THUNK_BASE + static_cast<uint64_t>(i) * THUNK_STRIDE, 0xCC);
+    for (size_t i = 0; i < thunks_.size(); ++i) {
+        uint64_t a = THUNK_BASE + static_cast<uint64_t>(i) * THUNK_STRIDE;
+        if (!put_fast(mem, a, thunks_[i].name)) mem.write8(a, 0xCC);
+    }
 }
 
 bool Loader::load_raw(const std::string& path, uint64_t load_addr) {

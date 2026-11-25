@@ -85,7 +85,7 @@ public:
     bool          take_yield_request();
     bool          is_event_handle(uint64_t h) const;
     bool          is_event_signaled(uint64_t h) const;
-    bool          try_acquire_event(uint64_t h);
+    bool          try_acquire_event(uint64_t h, uint32_t tid = 0);
     uint64_t      alloc_stack(uint64_t size);
     uint64_t      alloc_teb(uint64_t stack_top, uint64_t stack_size, uint32_t tid);
 
@@ -129,6 +129,13 @@ private:
         bool        signaled     = false;
         std::string name;
         int64_t     sem_count    = -1; // >=0: semaphore count, -1: event/mutex
+        bool        is_mutex     = false;
+        uint32_t    owner        = 0;
+        uint32_t    recursion    = 0;
+        void take(uint32_t tid) {
+            consume();
+            if (is_mutex) { owner = tid; recursion = 1; }
+        }
         void consume() {
             if (sem_count >= 0) signaled = --sem_count > 0;
             else if (!manual_reset) signaled = false;

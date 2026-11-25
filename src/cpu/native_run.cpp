@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
+#include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -15,6 +17,8 @@ extern uint8_t basalt_guest_ymm[];
 extern uint8_t basalt_in_guest;
 extern uint8_t basalt_syscall_sel;
 extern uint8_t basalt_stop;
+extern uint8_t basalt_last_sig;
+extern uint64_t basalt_last_addr;
 extern uint64_t basalt_regs_ptr;
 extern uint64_t basalt_host_rsp;
 void basalt_native_enter(uint64_t* gpr, uint64_t fs, uint64_t gs);
@@ -22,6 +26,15 @@ void basalt_native_return();
 void basalt_sig_entry(int, siginfo_t*, void*);
 
 static emu::cpu::Registers* g_regs = nullptr;
+// Per-thread CPU timer: ITIMER_VIRTUAL counts every host thread, so busy
+// workers made slices end after a few microseconds.
+static thread_local timer_t g_slice_timer;
+static thread_local bool g_slice_timer_ok = false;
+static void basalt_disarm_slice() {
+    if (!g_slice_timer_ok) return;
+    struct itimerspec off{};
+    timer_settime(g_slice_timer, 0, &off, nullptr);
+}
 static int g_stop = 0;
 
 void basalt_on_signal(int sig, siginfo_t*, void* ucp) {
@@ -55,8 +68,7 @@ void basalt_on_signal(int sig, siginfo_t*, void* ucp) {
     }
     basalt_in_guest = 0;
     basalt_syscall_sel = 0;
-    struct itimerval off{};
-    setitimer(ITIMER_VIRTUAL, &off, nullptr);
+    basalt_disarm_slice();
     auto& g = *g_regs;
     g.r8 = gr[REG_R8];   g.r9 = gr[REG_R9];   g.r10 = gr[REG_R10]; g.r11 = gr[REG_R11];
     g.r12 = gr[REG_R12]; g.r13 = gr[REG_R13]; g.r14 = gr[REG_R14]; g.r15 = gr[REG_R15];
@@ -78,13 +90,23 @@ namespace emu::cpu {
 alignas(64) static char g_alt_stack[8 << 20];
 
 static void arm(int usec) {
-    struct itimerval it{};
+    if (!g_slice_timer_ok) {
+        struct sigevent sev{};
+        sev.sigev_notify = SIGEV_THREAD_ID;
+        sev.sigev_signo = SIGVTALRM;
+        sev._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));
+        if (timer_create(CLOCK_THREAD_CPUTIME_ID, &sev, &g_slice_timer) != 0) {
+            std::fprintf(stderr, "  [cpu] timer_create failed: %d\n", errno);
+            return;
+        }
+        g_slice_timer_ok = true;
+    }
+    struct itimerspec it{};
     if (usec > 0) {
         it.it_value.tv_sec = usec / 1000000;
-        it.it_value.tv_usec = usec % 1000000;
-        it.it_interval = it.it_value;
+        it.it_value.tv_nsec = (usec % 1000000) * 1000L;
     }
-    setitimer(ITIMER_VIRTUAL, &it, nullptr);
+    timer_settime(g_slice_timer, 0, &it, nullptr);
 }
 
 NativeStop native_slice(Registers& regs) {
@@ -123,9 +145,10 @@ NativeStop native_slice(Registers& regs) {
     g_regs = &regs;
     basalt_regs_ptr = reinterpret_cast<uint64_t>(&regs);
     basalt_stop = 2;
+    basalt_last_sig = 0;
     basalt_in_guest = 0;
     basalt_syscall_sel = 0;
-    arm(4000);
+    arm(20000);
     basalt_native_enter(&regs.rax, regs.msr_fs_base, regs.msr_gs_base);
     arm(0);
     std::memcpy(&regs.ymm[0], basalt_guest_ymm, 16 * 32);
@@ -135,6 +158,7 @@ NativeStop native_slice(Registers& regs) {
     g_regs = nullptr;
     basalt_regs_ptr = 0;
     int stop = basalt_stop;
+    { static int k = 0; if ((++k & 0xfff) == 1) std::fprintf(stderr, "  [slice] sig=%d stop=%d rip=%llx addr=%llx rcx=%llx r10=%llx\n", basalt_last_sig, stop, (unsigned long long)regs.rip, (unsigned long long)basalt_last_addr, (unsigned long long)regs.rcx, (unsigned long long)regs.r10); }
     if (stop == 1) return NativeStop::Trap;
     if (stop == 4) return NativeStop::Syscall;
     if (stop == 3) return NativeStop::Fault;
