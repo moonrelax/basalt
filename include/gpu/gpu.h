@@ -32,7 +32,8 @@ struct DrawCall {
     bool indexed = false;
     uint32_t index_count = 0;
     uint32_t start_index = 0;
-    const uint32_t* indices = nullptr;
+    uint32_t index_stride = 4;
+    const uint8_t* index_bytes = nullptr;
     VertexView vertices{};
     ShaderView rdna2{};
 };
@@ -44,6 +45,10 @@ struct CommandList {
 };
 
 void submit(const CommandList& cmdlist);
+
+// Runs a recorded list on the software GPU, apart from the CPU HLE thread.
+// Same pixels as submit(); also logs the draw count the first few times.
+uint32_t kick(const CommandList& cmdlist);
 
 // Dumps the 1280x720 RT to /tmp/basalt-present.png when at least two
 // different non-black colors are present. Returns false for an empty

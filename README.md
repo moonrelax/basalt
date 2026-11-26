@@ -65,4 +65,4 @@ Xbox is a trademark of Microsoft; this project is not affiliated with it.
 
 ## License
 
-MIT
+GPL-3.0. Copyright (C) 2026 moonrelax. See LICENSE.

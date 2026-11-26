@@ -10,6 +10,7 @@
 #include "kernel/loader.h"
 #include "cpu/cpu.h"
 #include "memory/memory_map.h"
+#include "gpu/gpu.h"
 
 namespace emu::kernel {
 
@@ -101,6 +102,7 @@ public:
     void          pump_auto_task_queues();
     void          record_milestone(const std::string& label, uint64_t va);
     void          dump_milestones() const;
+    void signal_all_waiting_events();
 
 private:
     mutable int img_hint_ = -1;
@@ -205,6 +207,14 @@ private:
     std::map<std::string, uint64_t>  unknown_counts_;
     std::vector<Milestone>           milestones_;
     std::set<uint64_t>               milestone_seen_;
+    struct CmdListState {
+        gpu::CommandList cl;
+        gpu::VertexView  vb{};
+        const uint8_t*   ib = nullptr;
+        uint32_t         ib_count = 0;
+        uint32_t         ib_stride = 4;
+    };
+    std::map<uint64_t, CmdListState> cmd_lists_;
     uint64_t                         trace_from_   = 0;
     bool                             trace_active_ = false;
     int                              trace_budget_ = 200;

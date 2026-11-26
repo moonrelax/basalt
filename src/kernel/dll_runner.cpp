@@ -1333,7 +1333,13 @@ void DllRunner::handle_thunk(const Thunk& t) {
         // with SetEventOnCompletion.
         {
             static std::map<uint64_t, uint64_t> fence_value;
+            static std::map<uint64_t, uint64_t> fence_word;
             static std::multimap<uint64_t, std::pair<uint64_t, uint64_t>> fence_waits;
+            auto publish = [&](uint64_t obj, uint64_t value) {
+                if (value > fence_value[obj]) fence_value[obj] = value;
+                if (auto w = fence_word.find(obj); w != fence_word.end())
+                    mem_.write64(w->second, fence_value[obj]);
+            };
             auto fire = [&](uint64_t f) {
                 for (auto w = fence_waits.lower_bound(f); w != fence_waits.end() && w->first == f;) {
                     if (fence_value[f] >= w->second.first) {
@@ -1350,14 +1356,40 @@ void DllRunner::handle_thunk(const Thunk& t) {
                                  where(ret_addr).c_str());
             };
             if (iid == "{0ec870a6-5d7e-4c22}" && m_idx == 16) { // queue Signal
-                fence_value[arg(1)] = std::max(fence_value[arg(1)], arg(2));
+                publish(arg(1), arg(2));
                 flog("queue-signal", arg(1), arg(2));
                 fire(arg(1));
                 mst.stub_desc = "Signal";
                 return ret(0);
             }
+            // CreateFence(this, initialValue, flags, riid, ppFence).
+            // The completed value lives in a guest qword the title polls.
+            if (iid == "{5405c344-d457-444e}" && m_idx == 36) {
+                uint64_t obj = make_fake_com("{0a753dcf-c4d8-4b91}");
+                uint64_t word = alloc(8, 8);
+                uint64_t initial = arg(1);
+                mem_.write64(word, initial);
+                fence_value[obj] = initial;
+                fence_word[obj] = word;
+                if (arg(4) > 0x10000 && arg(4) < (1ULL << 47)) mem_.write64(arg(4), obj);
+                flog("create", obj, initial);
+                mst.stub_desc = "CreateFence";
+                return ret(0);
+            }
             if (iid == "{0a753dcf-c4d8-4b91}") {
                 if (m_idx == 8) { mst.stub_desc = "GetCompletedValue"; return ret(fence_value[arg(0)]); }
+                // vtable+0x60. The caller uses the return as a pointer and
+                // loads the completed value through it (monitorx on that line).
+                if (m_idx == 12) {
+                    auto& word = fence_word[arg(0)];
+                    if (!word) {
+                        word = alloc(8, 8);
+                        mem_.write64(word, fence_value[arg(0)]);
+                    }
+                    flog("value-word", arg(0), fence_value[arg(0)]);
+                    mst.stub_desc = "completed value address";
+                    return ret(word);
+                }
                 if (m_idx == 9) { // SetEventOnCompletion(value, event)
                     flog("set-event-on-completion", arg(0), arg(1));
                     if (fence_value[arg(0)] >= arg(1) || !arg(2)) {
@@ -1369,7 +1401,7 @@ void DllRunner::handle_thunk(const Thunk& t) {
                     return ret(0);
                 }
                 if (m_idx == 10) { // Signal from CPU
-                    fence_value[arg(0)] = arg(1);
+                    publish(arg(0), arg(1));
                     flog("cpu-signal", arg(0), arg(1));
                     fire(arg(0));
                     mst.stub_desc = "Signal";
@@ -1378,6 +1410,20 @@ void DllRunner::handle_thunk(const Thunk& t) {
             }
         }
         if (iid == "{0ec870a6-5d7e-4c22}" && m_idx == 35) {
+            for (auto& [obj, st] : cmd_lists_) {
+                if (!st.cl.draws.empty() || st.cl.clear) {
+                    emu::gpu::kick(st.cl);
+                    st.cl.draws.clear();
+                    st.cl.clear = false;
+                }
+            }
+            const auto* bb = emu::gpu::device().resource(emu::gpu::device().backbuffer());
+            uint64_t bb_va = bb ? bb->va : 0;
+            if (bb_va) {
+                const uint8_t* rt = emu::gpu::render_target();
+                uint8_t* dst = mem_.raw_ptr(bb_va, 1280ULL * 720 * 4);
+                if (dst && rt) std::memcpy(dst, rt, 1280ULL * 720 * 4);
+            }
             emu::gpu::present(mem_, arg(3), nullptr);
             mst.stub_desc = "PresentX";
             return ret(0);
@@ -1404,16 +1450,86 @@ void DllRunner::handle_thunk(const Thunk& t) {
         // ClearRenderTargetView(this, cpuHandle, rgba, numRects, rects).
         if (iid == "{5b160d0f-ac1b-4185}" && (m_idx == 12 || m_idx == 13)) {
             static int draw_logs = 0;
-            if (draw_logs < 8) {
+            if (draw_logs < 32) {
                 ++draw_logs;
-                std::fprintf(stderr, "    [draw] %s verts=%llu inst=%llu\n",
+                std::fprintf(stderr, "    [draw] %s verts=%llu inst=%llu this=0x%llx\n",
                              m_idx == 12 ? "DrawInstanced" : "DrawIndexed",
                              static_cast<unsigned long long>(arg(1)),
-                             static_cast<unsigned long long>(arg(2)));
+                             static_cast<unsigned long long>(arg(2)),
+                             static_cast<unsigned long long>(arg(0)));
             }
+            auto it = cmd_lists_.find(arg(0));
+            if (it == cmd_lists_.end()) {
+                cmd_lists_[arg(0)] = CmdListState{};
+                it = cmd_lists_.find(arg(0));
+            }
+            auto& st = it->second;
+            gpu::DrawCall dc{};
+            if (m_idx == 12) {
+                dc.vertex_count   = static_cast<uint32_t>(arg(1));
+                dc.instance_count = static_cast<uint32_t>(arg(2));
+                dc.start_vertex   = static_cast<uint32_t>(arg(3));
+                dc.start_instance = static_cast<uint32_t>(arg(4));
+            } else {
+                dc.indexed      = true;
+                dc.index_count  = static_cast<uint32_t>(arg(1));
+                dc.instance_count = static_cast<uint32_t>(arg(2));
+                dc.start_index  = static_cast<uint32_t>(arg(3));
+                dc.start_vertex = static_cast<uint32_t>(arg(4));
+                dc.start_instance = static_cast<uint32_t>(arg(5));
+                dc.index_bytes  = st.ib;
+                dc.index_stride = st.ib_stride ? st.ib_stride : 4;
+                dc.index_count  = dc.index_count ? dc.index_count : st.ib_count;
+            }
+            dc.vertices = st.vb;
+            st.cl.draws.push_back(dc);
             mst.stub_desc = "Draw";
             return ret(0);
         }
+        // IASetVertexBuffers(this, startSlot, numViews, pViews)
+        if (iid == "{5b160d0f-ac1b-4185}" && m_idx == 43) {
+            auto it = cmd_lists_.find(arg(0));
+            if (it == cmd_lists_.end()) { cmd_lists_[arg(0)] = CmdListState{}; it = cmd_lists_.find(arg(0)); }
+            uint64_t view_ptr = arg(3);
+            if (view_ptr) {
+                uint64_t buf_va = mem_.read64(view_ptr);
+                uint32_t size   = mem_.read32(view_ptr + 8);
+                uint32_t stride = mem_.read32(view_ptr + 12);
+                uint8_t* data = mem_.raw_ptr(buf_va, size);
+                if (data && stride > 0) {
+                    it->second.vb = gpu::VertexView{data, stride, size / stride};
+                    static int vb_logs = 0;
+                    if (vb_logs < 8) {
+                        ++vb_logs;
+                        std::fprintf(stderr, "    [draw] IASetVB va=0x%llx stride=%u count=%u\n",
+                                     static_cast<unsigned long long>(buf_va), stride, size / stride);
+                    }
+                }
+            }
+            mst.stub_desc = "IASetVertexBuffers";
+            return ret(0);
+        }
+        // IASetIndexBuffer(this, pView)
+        if (iid == "{5b160d0f-ac1b-4185}" && m_idx == 44) {
+            auto it = cmd_lists_.find(arg(0));
+            if (it == cmd_lists_.end()) { cmd_lists_[arg(0)] = CmdListState{}; it = cmd_lists_.find(arg(0)); }
+            uint64_t view_ptr = arg(1);
+            if (view_ptr) {
+                uint64_t buf_va = mem_.read64(view_ptr);
+                uint32_t size   = mem_.read32(view_ptr + 8);
+                uint32_t format = mem_.read32(view_ptr + 12);
+                uint32_t idx_size = (format == 57) ? 2 : 4; // DXGI_FORMAT_R16_UINT=57
+                uint8_t* data = mem_.raw_ptr(buf_va, size);
+                if (data) {
+                    it->second.ib = data;
+                    it->second.ib_stride = idx_size;
+                    it->second.ib_count = size / idx_size;
+                }
+            }
+            mst.stub_desc = "IASetIndexBuffer";
+            return ret(0);
+        }
+        // ClearRenderTargetView(this, cpuHandle, rgba, numRects, rects)
         if (iid == "{5b160d0f-ac1b-4185}" && m_idx == 52) {
             float color[4] = {0.f, 0.f, 0.f, 1.f};
             if (arg(2)) {
@@ -1422,6 +1538,10 @@ void DllRunner::handle_thunk(const Thunk& t) {
                     std::memcpy(&color[i], &bits, 4);
                 }
             }
+            auto it = cmd_lists_.find(arg(0));
+            if (it == cmd_lists_.end()) { cmd_lists_[arg(0)] = CmdListState{}; it = cmd_lists_.find(arg(0)); }
+            it->second.cl.clear = true;
+            for (int i = 0; i < 4; ++i) it->second.cl.clear_rgba[i] = color[i];
             if (!emu::gpu::clear_render_target(mem_, arg(1), color))
                 emu::gpu::clear_render_target(mem_, emu::gpu::device().backbuffer(), color);
             mst.stub_desc = "ClearRenderTargetView";
@@ -1900,6 +2020,7 @@ void DllRunner::handle_thunk(const Thunk& t) {
             uint64_t ppv = arg(5);
             uint64_t obj = make_fake_com("{5b160d0f-ac1b-4185}");
             if (ppv > 0x10000 && ppv < (1ULL << 47)) mem_.write64(ppv, obj);
+            cmd_lists_[obj] = CmdListState{};
             mst.stub_desc = "CreateCommandList";
             if (mst.calls <= 4)
                 std::fprintf(stderr, "    [d3d12] command list -> 0x%llx ppv=0x%llx\n",
@@ -3231,6 +3352,24 @@ void DllRunner::handle_thunk(const Thunk& t) {
     }
     if (is({"CreateDirectoryW", "CreateDirectoryA"})) return ret(1);
 
+    if (is({"strncpy_s"})) {
+        uint8_t* dst = mem_.raw_ptr(r.rcx, r.rdx);
+        const uint8_t* src = mem_.raw_ptr(r.r8, r.r9);
+        if (dst && src && r.rdx > 0) {
+            uint64_t max_copy = r.rdx - 1;
+            if (r.r9 < max_copy) max_copy = r.r9;
+            uint64_t i = 0;
+            for (; i < max_copy && src[i]; ++i) dst[i] = src[i];
+            dst[i] = 0;
+        } else if (dst && r.rdx > 0) {
+            dst[0] = 0;
+        }
+        return ret(0);
+    }
+    if (is({"_wfopen", "_wfopen_s"})) {
+        return ret(0);
+    }
+
     for (auto& s : XboxGdkStubs::stubs())
         if (n == s.name) return ret(s.ret_val);
 
@@ -3479,6 +3618,14 @@ void DllRunner::run_all(const std::string& game_dir, bool run_exe) {
     uint64_t rv = call_guest(img->entry_point);
     std::fprintf(stderr, "  [exe] %s after %llu insns (rv=%llu)\n", abort_ ? "stopped" : "returned",
                 (unsigned long long)insn_count_, (unsigned long long)rv);
+}
+
+void DllRunner::signal_all_waiting_events() {
+    for (auto& [h, ev] : events_) {
+        if (!ev.signaled && !ev.is_mutex) {
+            ev.signaled = true;
+        }
+    }
 }
 
 } // namespace emu::kernel

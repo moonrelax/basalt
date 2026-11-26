@@ -23,21 +23,48 @@ uint8_t chan(float c) {
     return static_cast<uint8_t>(c * 255.f + 0.5f);
 }
 
+uint32_t read_index(const DrawCall& d, uint32_t slot) {
+    const uint32_t at = d.start_index + slot;
+    if (!d.index_bytes || at >= d.index_count) return 0xffffffffu;
+    const uint8_t* p = d.index_bytes + static_cast<uint64_t>(at) * d.index_stride;
+    if (d.index_stride == 2) {
+        uint16_t x = 0;
+        std::memcpy(&x, p, 2);
+        return x == 0xffffu ? 0xffffffffu : x;
+    }
+    uint32_t x = 0;
+    std::memcpy(&x, p, 4);
+    return x;
+}
+
 bool fetch(const DrawCall& d, uint32_t slot, Vtx& out) {
     uint32_t index = d.start_vertex + slot;
     if (d.indexed) {
-        if (!d.indices || slot >= d.index_count) return false;
-        index = d.indices[d.start_index + slot];
+        index = read_index(d, slot);
+        if (index == 0xffffffffu) return false;
+        index += d.start_vertex;
     }
     if (!d.vertices.data || index >= d.vertices.count) return false;
-    if (d.vertices.stride < 6 * sizeof(float)) return false;
+    if (d.vertices.stride < 2 * sizeof(float)) return false;
+    const uint32_t nf = d.vertices.stride / sizeof(float);
     const auto* p = reinterpret_cast<const float*>(d.vertices.data + index * d.vertices.stride);
-    float regs[kVgprCount] = {p[0], p[1], p[2], p[3], p[4], p[5]};
-    float exported[4] = {regs[2], regs[3], regs[4], regs[5]};
-    if (d.rdna2.bytes && d.rdna2.size) {
-        if (!exec_rdna2(d.rdna2.bytes, d.rdna2.size, regs, exported)) return false;
+    float regs[kVgprCount] = {};
+    for (uint32_t i = 0; i < nf && i < static_cast<uint32_t>(kVgprCount); ++i)
+        regs[i] = p[i];
+    RdnaOut io;
+    io.color[0] = nf > 2 ? regs[2] : 1.f;
+    io.color[1] = nf > 3 ? regs[3] : 1.f;
+    io.color[2] = nf > 4 ? regs[4] : 1.f;
+    io.color[3] = nf > 5 ? regs[5] : 1.f;
+    if (d.rdna2.bytes && d.rdna2.size)
+        exec_rdna2(d.rdna2.bytes, d.rdna2.size, regs, io);
+    float x = regs[0];
+    float y = regs[1];
+    if (io.pos_written && io.pos[3] != 0.f) {
+        x = io.pos[0] / io.pos[3];
+        y = io.pos[1] / io.pos[3];
     }
-    out = {regs[0], regs[1], exported[0], exported[1], exported[2], exported[3]};
+    out = {x, y, io.color[0], io.color[1], io.color[2], io.color[3]};
     return true;
 }
 
@@ -180,6 +207,20 @@ bool write_png(const char* path) {
 }
 
 } // namespace
+
+uint32_t kick(const CommandList& cmdlist) {
+    uint32_t n = 0;
+    for (const DrawCall& d : cmdlist.draws)
+        n += d.indexed ? d.index_count : d.vertex_count;
+    submit(cmdlist);
+    static int logs = 0;
+    if (logs < 8 && !cmdlist.draws.empty()) {
+        ++logs;
+        std::fprintf(stderr, "    [gpu] kick draws=%zu verts=%u colors=%u\n",
+                     cmdlist.draws.size(), n, distinct_colors());
+    }
+    return n;
+}
 
 void submit(const CommandList& cmdlist) {
     if (cmdlist.clear) {

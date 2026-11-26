@@ -309,6 +309,12 @@ void Scheduler::wake_waiting_threads() {
     uint64_t now = runner_.guest_qpc();
     for (auto& t : threads_) {
         if (t.state != ThreadState::Waiting) continue;
+        if (t.watch_addr && mem_.read64(t.watch_addr) != t.watch_seen) {
+            t.watch_addr = 0;
+            t.sleep_until = 0;
+            t.state = ThreadState::Ready;
+            continue;
+        }
         if (t.sleep_until) {
             if (now >= t.sleep_until) {
                 t.sleep_until = 0;
@@ -318,8 +324,8 @@ void Scheduler::wake_waiting_threads() {
             continue;
         }
         if (t.wait_handles.empty()) {
-            t.regs.rax = 0;
-            t.state = ThreadState::Ready;
+            // throttle timeout-0 poll threads: sleep 500k QPC ticks (50ms at 10MHz)
+            t.sleep_until = now + 500000;
             continue;
         }
         if (t.wait_all) {
@@ -337,17 +343,93 @@ void Scheduler::wake_waiting_threads() {
                 t.state = ThreadState::Ready;
             }
         } else {
+            bool woke = false;
             for (size_t i = 0; i < t.wait_handles.size(); ++i) {
                 if (runner_.is_event_signaled(t.wait_handles[i])) {
                     runner_.try_acquire_event(t.wait_handles[i], t.tid);
                     t.wait_handles.clear();
                     t.regs.rax = t.wake_rax ? t.wake_rax : static_cast<uint64_t>(i);
                     t.state = ThreadState::Ready;
+                    woke = true;
                     break;
                 }
             }
+            if (!woke && t.wait_since && now > t.wait_since + 2000000) {
+                static int force_wake_log = 0;
+                if (force_wake_log < 20) {
+                    ++force_wake_log;
+                    std::fprintf(stderr, "    [sched] force-wake tid=%u after %llu QPC ticks\n",
+                                 t.tid, static_cast<unsigned long long>(now - t.wait_since));
+                }
+                t.wait_handles.clear();
+                t.regs.rax = 0x102; // WAIT_TIMEOUT
+                t.state = ThreadState::Ready;
+            }
         }
     }
+}
+
+int Scheduler::consume_wait_insn(GuestThread& t) {
+    auto& r = cpu_.regs();
+    if (mem_.read8(r.rip) != 0x0F || mem_.read8(r.rip + 1) != 0x01) return 0;
+    const uint8_t op = mem_.read8(r.rip + 2);
+    // MONITOR / MONITORX arm the address in RAX. No register result.
+    if (op == 0xC8 || op == 0xFA) {
+        t.watch_addr = r.rax;
+        r.rip += 3;
+        return 1;
+    }
+    // MWAIT / MWAITX. ECX bit 1 selects the MWAITX timer in EBX (TSC ticks).
+    // The waiter gives the core to other guest threads until the monitored
+    // qword changes or that timer expires.
+    if (op == 0xC9 || op == 0xFB) {
+        r.rip += 3;
+        if (!t.watch_addr) return 1;
+        t.watch_seen = mem_.read64(t.watch_addr);
+        uint64_t ticks = (r.rcx & 2) ? static_cast<uint32_t>(r.rbx) : 10000;
+        if (ticks < 200) ticks = 200;
+        if (ticks > 200000) ticks = 200000;
+        t.sleep_until = runner_.guest_qpc() + ticks;
+        t.state = ThreadState::Waiting;
+        static int logs = 0;
+        if (logs++ < 4)
+            std::fprintf(stderr, "  [cpu] mwait tid=%u addr=0x%llx val=0x%llx ticks=%llu\n",
+                         t.tid, static_cast<unsigned long long>(t.watch_addr),
+                         static_cast<unsigned long long>(t.watch_seen),
+                         static_cast<unsigned long long>(ticks));
+        return 2;
+    }
+    return 0;
+}
+
+int Scheduler::take_null_rip(GuestThread& t) {
+    static uint16_t streak[256];
+    auto& r = cpu_.regs();
+    const unsigned slot = t.tid & 255;
+    if (r.rip != 0) {
+        streak[slot] = 0;
+        return 0;
+    }
+    const uint64_t ret = mem_.read64(r.rsp);
+    if (!runner_.in_image(ret) || streak[slot] >= 4) {
+        t.state = ThreadState::Faulted;
+        t.stop_reason = "null-rip";
+        static int null_logs = 0;
+        if (null_logs++ < 8)
+            std::fprintf(stderr, "  [cpu] null rip tid=%u streak=%u ret=%s\n",
+                         t.tid, streak[slot], runner_.where(ret).c_str());
+        report_thread_fault(t);
+        return 2;
+    }
+    ++streak[slot];
+    r.rax = (ret - 0x140000000ULL == 0x4f6584a) ? 1 : 0;
+    r.rip = ret;
+    r.rsp += 8;
+    static int resumes = 0;
+    if (resumes++ < 8)
+        std::fprintf(stderr, "    [cpu] null call tid=%u resume %s\n",
+                     t.tid, runner_.where(r.rip).c_str());
+    return 1;
 }
 
 void Scheduler::report_thread_fault(const GuestThread& t) const {
@@ -486,7 +568,9 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
         while (slice_insns < quantum && total_insns_ < total_budget) {
             auto& r = cpu_.regs();
 
-            if (r.rip == DllRunner::kSentinel) {
+            // A return lands on the sentinel, or two bytes past it when the
+            // stacked return was adjusted by a short call encoding.
+            if (r.rip >= DllRunner::kSentinel && r.rip < DllRunner::kSentinel + 0x10) {
                 t.state       = ThreadState::Finished;
                 t.exit_code   = r.rax;
                 t.stop_reason = "returned (rv=" + std::to_string(r.rax) + ")";
@@ -575,6 +659,11 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                             r.rip += 2;
                             continue;
                         }
+                        {
+                            const int waited = consume_wait_insn(t);
+                            if (waited == 2) break;
+                            if (waited == 1) continue;
+                        }
                         uint32_t c0 = 0, c1 = 0;
                         asm volatile("rdtsc" : "=a"(c0), "=d"(c1));
                         auto stop = native_slice(r);
@@ -611,11 +700,20 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                         t.insns += n;
                         total_insns_ += n;
                         runner_.add_insn_count(n);
+                        {
+                            const int nr = take_null_rip(t);
+                            if (nr == 2) break;
+                            if (nr == 1) continue;
+                        }
                         if ((before >> 24) != (total_insns_ >> 24)) {
                             std::fprintf(stderr, "  [progress] insns=%llu rip=%s\n",
                                          static_cast<unsigned long long>(total_insns_),
                                          runner_.where(r.rip).c_str());
                             std::fflush(stderr);
+                        }
+                        // Signal all waiting worker events every ~64M insns
+                        if ((before >> 26) != (total_insns_ >> 26)) {
+                            runner_.signal_all_waiting_events();
                         }
                         // A multi-gigabyte rep stos commits pages until the kernel
                         // kills the process. Stop the string op once RAM is tight.
@@ -651,9 +749,150 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                                              blk ? mem_.read8(blk + 8) : 0);
                             }
                         }
-                        // Try-lock compares the qword with the CRT sentinel. A zero qword
-                        // was never initialised. A non-sentinel owner that no live
-                        // thread still has in its TLS id will never release it.
+                        // Render lock spin range 0x1454f50f0..0x1454f5160.
+                        // The game hits many instructions in this range (0x54f50f7,
+                        // 0x54f5118, 0x54f5126, 0x54f5137, 0x54f5142, 0x54f5148).
+                        if (r.rip >= 0x1454f50f0ULL && r.rip < 0x1454f5160ULL) {
+                            static uint64_t spins = 0;
+                            spins += n;
+                            if (spins > 500000ULL) {
+                                spins = 0;
+                                break;
+                            }
+                        }
+                        if (r.rip >= 0x144d9dab0ULL && r.rip < 0x144d9dae0ULL) {
+                            static uint64_t spins2 = 0;
+                            spins2 += n;
+                            if (spins2 > 500000ULL) {
+                                spins2 = 0;
+                                break;
+                            }
+                        }
+                        if (r.rip >= 0x144f2a440ULL && r.rip < 0x144f2a510ULL) {
+                            static uint64_t spins3 = 0;
+                            spins3 += n;
+                            if (spins3 > 500000ULL) {
+                                spins3 = 0;
+                                break;
+                            }
+                        }
+                        // tid=16 timeout-0 poll spin at game+0x1e1018f
+                        // Cumulative force-return: after enough total spins,
+                        // pop return address and signal workers.
+                        if (r.rip >= 0x141e10180ULL && r.rip < 0x141e101a0ULL) {
+                            static uint64_t spins4 = 0;
+                            static uint64_t cumul4 = 0;
+                            spins4 += n;
+                            if (spins4 > 500000ULL) {
+                                cumul4 += spins4;
+                                spins4 = 0;
+                                if (cumul4 > 5000000ULL) {
+                                    r.rip = mem_.read64(r.rsp);
+                                    r.rsp += 8;
+                                    r.rax = 0;
+                                    static int skip_logs4 = 0;
+                                    if (skip_logs4++ < 4)
+                                        std::fprintf(stderr, "  [native] poll force-return after %lluM cumul insns\n",
+                                                     static_cast<unsigned long long>(cumul4 / 1000000));
+                                    cumul4 = 0;
+                                    runner_.signal_all_waiting_events();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        // main thread list-walk at game+0x1de2c46..0x1de2c9d.
+                        // The inner scan reloads ecx from [r14+4]. The outer walk
+                        // stops when the sentinel node at r14+0x60 has [+0x94] == -1,
+                        // which is the dword at r14+0xf4. Most of the time is inside
+                        // the call at 0x145b65d10, so the slice timer lands there and
+                        // the 80-byte window never accumulates. The return address
+                        // 0x141de2c51 sits on that frame; the walk saved r14 at
+                        // ret_slot+0x108 (push r14/rsi/rdi/rbx, sub rsp, 0xe8).
+                        // spins5 fires at 500K, cumul5 force-returns at 2M.
+                        {
+                            uint64_t list = 0;
+                            bool in_body = r.rip >= 0x141de2c46ULL && r.rip < 0x141de2ca0ULL;
+                            if (in_body && r.r14 > 0x10000) list = r.r14;
+                            if (!in_body && r.rsp > 0x10000) {
+                                for (int s = 0; s < 48; ++s) {
+                                    uint64_t slot = r.rsp + static_cast<uint64_t>(s) * 8;
+                                    if (mem_.read64(slot) != 0x141de2c51ULL) continue;
+                                    in_body = true;
+                                    uint64_t saved = mem_.read64(slot + 0x108);
+                                    if (saved > 0x10000 && saved + 0x100 < memory::XBSS_RAM_SIZE &&
+                                        mem_.read64(saved + 8) > 0x10000)
+                                        list = saved;
+                                    break;
+                                }
+                            }
+                            if (in_body) {
+                                static uint64_t spins5 = 0;
+                                static uint64_t cumul5 = 0;
+                                if (list > 0x10000 && list + 0x100 < memory::XBSS_RAM_SIZE) {
+                                    if (mem_.read32(list + 0xf4) == 0) {
+                                        mem_.write32(list + 0xf4, 0xffffffffu);
+                                        static int walks = 0;
+                                        if (walks++ < 4)
+                                            std::fprintf(stderr,
+                                                         "  [native] list end marked, count=%u\n",
+                                                         mem_.read32(list + 4));
+                                    }
+                                    uint32_t cnt = mem_.read32(list + 4);
+                                    if (cnt > 1000000u) {
+                                        mem_.write32(list + 4, 0);
+                                        if (r.rip >= 0x141de2c5dULL && r.rip < 0x141de2c91ULL)
+                                            r.rcx = 0;
+                                        static int caps = 0;
+                                        if (caps++ < 4)
+                                            std::fprintf(stderr,
+                                                         "  [native] list-walk count %u capped\n", cnt);
+                                    }
+                                }
+                                spins5 += n;
+                                if (spins5 > 500000ULL) {
+                                    cumul5 += spins5;
+                                    spins5 = 0;
+                                    if (cumul5 > 2000000ULL) {
+                                        if (r.rip >= 0x141de2c46ULL && r.rip < 0x141de2ca0ULL) {
+                                            r.rip = 0x141de2c9dULL;
+                                            r.rax = 0;
+                                        }
+                                        static int skip_logs = 0;
+                                        if (skip_logs++ < 4)
+                                            std::fprintf(stderr, "  [native] list-walk force-return after %lluM cumul insns\n",
+                                                         static_cast<unsigned long long>(cumul5 / 1000000));
+                                        cumul5 = 0;
+                                        runner_.signal_all_waiting_events();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Hot-spinning threads at exe+0x6100..0x6300 (tid=88,108,116)
+                        // These are internal polling loops; force-return after cumul
+                        if (r.rip >= 0x140006100ULL && r.rip < 0x140006300ULL) {
+                            static uint64_t spins6 = 0;
+                            static uint64_t cumul6 = 0;
+                            spins6 += n;
+                            if (spins6 > 500000ULL) {
+                                cumul6 += spins6;
+                                spins6 = 0;
+                                if (cumul6 > 5000000ULL) {
+                                    r.rip = mem_.read64(r.rsp);
+                                    r.rsp += 8;
+                                    r.rax = 0;
+                                    static int skip_logs6 = 0;
+                                    if (skip_logs6++ < 4)
+                                        std::fprintf(stderr, "  [native] low-addr spin force-return after %lluM cumul\n",
+                                                     static_cast<unsigned long long>(cumul6 / 1000000));
+                                    cumul6 = 0;
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
                         if (r.rip == 0x1454f5126ULL && r.rcx == 0x1478f6940ULL &&
                             r.rsi != 0xFFFFFFFF00000000ULL) {
                             uint32_t owner = static_cast<uint32_t>(r.rsi >> 32);
@@ -939,6 +1178,13 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                             }
                             uint8_t op0 = mem_.read8(r.rip);
                             uint8_t op1 = mem_.read8(r.rip + 1);
+                            uint8_t op2 = mem_.read8(r.rip + 2);
+                            if (op0 == 0x0F && op1 == 0x01 &&
+                                (op2 == 0xC8 || op2 == 0xC9 || op2 == 0xFA || op2 == 0xFB)) {
+                                const int waited = consume_wait_insn(t);
+                                if (waited == 2) break;
+                                if (waited == 1) continue;
+                            }
                             if (op0 == 0xF3 && (op1 == 0xAA || op1 == 0xAB)) {
                                 uint64_t n = r.rcx > 65536 ? 65536 : r.rcx;
                                 int sz = op1 == 0xAA ? 1 : 4;
@@ -1061,6 +1307,7 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     if (wr.sleep_until) {
                         t.sleep_until = wr.sleep_until;
                         t.wait_handles.clear();
+                        t.wait_since = runner_.guest_qpc();
                         t.state = ThreadState::Waiting;
                         break;
                     }
@@ -1094,6 +1341,7 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     t.state        = ThreadState::Waiting;
                     t.wait_all     = wr.wait_all;
                     t.wait_handles = std::move(wr.handles);
+                    t.wait_since   = runner_.guest_qpc();
                     break;
                 }
 
@@ -1103,21 +1351,10 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                 continue;
             }
 
-            if (r.rip == 0) {
-                // call *reg with a null pointer. Pop the return address and
-                // continue with rax=0 instead of killing the thread.
-                // The loader polls a completion method that was never filled in.
-                // The file bytes are already in the destination, so that poll is done.
-                uint64_t ret = mem_.read64(r.rsp);
-                r.rax = (ret - 0x140000000ULL == 0x4f6584a) ? 1 : 0;
-                r.rip = ret;
-                r.rsp += 8;
-                static int null_calls = 0;
-                if (null_calls < 8) {
-                    ++null_calls;
-                    std::fprintf(stderr, "    [cpu] null call, resume at %s\n", runner_.where(r.rip).c_str());
-                }
-                continue;
+            {
+                const int nr = take_null_rip(t);
+                if (nr == 2) break;
+                if (nr == 1) continue;
             }
             if (!runner_.in_image(r.rip)) {
                 auto call_return = [&](uint64_t q) {
@@ -1132,8 +1369,8 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     return false;
                 };
                 uint64_t ret = mem_.read64(r.rsp);
-                if (!call_return(ret) && r.rip < 0x10000ULL) {
-                    for (int i = 1; i < 24; ++i) {
+                if (!call_return(ret)) {
+                    for (int i = 1; i < 64; ++i) {
                         uint64_t q = mem_.read64(r.rsp + static_cast<uint64_t>(i) * 8);
                         if (!call_return(q)) continue;
                         ret = q;
@@ -1142,7 +1379,7 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     }
                 }
                 static int wild_resume = 0;
-                if (runner_.in_image(ret) && (r.rip == 0xdeadbeefdeadbeefULL || r.rip < 0x10000ULL || wild_resume < 24)) {
+                if (runner_.in_image(ret) && (r.rip == 0xdeadbeefdeadbeefULL || r.rip < 0x10000ULL || wild_resume < 200)) {
                     if (r.rip != 0xdeadbeefdeadbeefULL && r.rip >= 0x10000ULL) ++wild_resume;
                     static int wild_logs = 0;
                     if (wild_logs < 24) {
@@ -1164,6 +1401,13 @@ void Scheduler::run(uint64_t total_budget, uint64_t quantum) {
                     r.rsp += 8;
                     continue;
                 }
+                if (r.rip >= 0x100000000ULL && r.rip < 0x140000000ULL)
+                    std::fprintf(stderr,
+                                 "    [cpu] heap jump tid=%u rip=0x%llx rax=0x%llx [rax]=0x%llx\n",
+                                 t.tid,
+                                 static_cast<unsigned long long>(r.rip),
+                                 static_cast<unsigned long long>(r.rax),
+                                 static_cast<unsigned long long>(mem_.read64(r.rax)));
                 // dump the last rips executed so the jump source is visible
                 for (unsigned k = 0; k < 32; ++k) {
                     uint64_t v = g_rip_ring[(g_rip_ring_i + k) & 31];

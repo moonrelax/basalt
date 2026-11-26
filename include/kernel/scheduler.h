@@ -30,8 +30,13 @@ struct GuestThread {
     uint64_t              wake_rax   = 0;
     uint64_t              sleep_until = 0; // guest QPC tick; 0 means not asleep
     std::vector<uint64_t> wait_handles;
+    uint64_t              wait_since = 0; // QPC tick when entered Waiting
     uint64_t              insns      = 0;
     uint64_t              slices     = 0;
+    // Address armed by MONITORX/MONITOR. MWAITX sleeps until this qword
+    // changes or its timer runs out.
+    uint64_t              watch_addr = 0;
+    uint64_t              watch_seen = 0;
     uint64_t              exit_code  = 0;
     std::string           name;
     std::string           stop_reason;
@@ -74,6 +79,11 @@ private:
     void ingest_pending();
     void wake_waiting_threads();
     void report_thread_fault(const GuestThread& t) const;
+    // 0: rip is live. 1: resumed a null call. 2: thread faulted (rip stayed 0).
+    int take_null_rip(GuestThread& t);
+    // 0: not a wait opcode. 1: MONITOR/MONITORX, RIP advanced.
+    // 2: MWAIT/MWAITX, thread parked in Waiting.
+    int consume_wait_insn(GuestThread& t);
     void print_summary() const;
 };
 
